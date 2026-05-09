@@ -40,10 +40,7 @@ pub fn decryptMessage(
 
     const out = try allocator.alloc(u8, ct_len);
     errdefer allocator.free(out);
-    Aes128Gcm.decrypt(out, ct, tag, additional_data, nonce, read_key) catch {
-        allocator.free(out);
-        return error.DecryptFailed;
-    };
+    Aes128Gcm.decrypt(out, ct, tag, additional_data, nonce, read_key) catch return error.DecryptFailed;
     return out;
 }
 

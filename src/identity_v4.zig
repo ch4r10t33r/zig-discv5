@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const Secp256k1 = std.crypto.ecc.Secp256k1;
+const Keccak256 = std.crypto.hash.sha3.Keccak256;
 
 const EcdsaV4 = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256;
 
@@ -32,6 +33,23 @@ fn compressJacobian(p: Secp256k1) [33]u8 {
 pub fn compressedPubkeyFromSecretKey(secret_key: [32]u8) EcdhError![33]u8 {
     const p = try Secp256k1.basePoint.mul(secret_key, .big);
     return compressJacobian(p);
+}
+
+/// Ethereum v4 node id: Keccak-256 over 64-byte uncompressed SEC1 `x || y` (no `0x04` prefix).
+pub fn nodeIdV4FromCompressedSec1(compressed: [33]u8) EcdhError![32]u8 {
+    const q = try Secp256k1.fromSec1(&compressed);
+    const aff = q.affineCoordinates();
+    var xy: [64]u8 = undefined;
+    @memcpy(xy[0..32], &aff.x.toBytes(.big));
+    @memcpy(xy[32..64], &aff.y.toBytes(.big));
+    var out: [32]u8 = undefined;
+    Keccak256.hash(&xy, &out, .{});
+    return out;
+}
+
+pub fn nodeIdV4FromSecretKey(secret_key: [32]u8) EcdhError![32]u8 {
+    const pk = try compressedPubkeyFromSecretKey(secret_key);
+    return nodeIdV4FromCompressedSec1(pk);
 }
 
 /// ECDH shared secret `local_secret_key * remote_public` in discv5 encoding:

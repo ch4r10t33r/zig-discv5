@@ -6,13 +6,15 @@ const handshake = @import("handshake.zig");
 
 pub const InitError = error{ZeroCapacity};
 
+pub const IpAddr = union(enum) {
+    v4: [4]u8,
+    v6: [16]u8,
+};
+
 /// Remote peer identity plus UDP endpoint. Used as the session cache key (node id and IP/port).
 pub const UdpEndpoint = struct {
     node_id: [32]u8,
-    ip: union(enum) {
-        v4: [4]u8,
-        v6: [16]u8,
-    },
+    ip: IpAddr,
     /// Port in host byte order; use the same convention as your socket layer when looking up sessions.
     port: u16,
 
@@ -45,6 +47,22 @@ pub const CachedSession = struct {
         };
     }
 
+    pub fn readKeyPeerWasInitiator(self: *const CachedSession) [16]u8 {
+        return self.initiator_key;
+    }
+
+    pub fn writeKeyPeerWasInitiator(self: *const CachedSession) [16]u8 {
+        return self.recipient_key;
+    }
+
+    pub fn readKeyWeWereInitiator(self: *const CachedSession) [16]u8 {
+        return self.recipient_key;
+    }
+
+    pub fn writeKeyWeWereInitiator(self: *const CachedSession) [16]u8 {
+        return self.initiator_key;
+    }
+
     /// Writes the next 12-byte GCM nonce and increments the counter (wrapping add).
     /// First four bytes are **big-endian** `outbound_nonce_counter` before the increment; last eight are `random_suffix`.
     pub fn nextMessageNonce(self: *CachedSession, random_suffix: [8]u8) [12]u8 {
@@ -65,7 +83,13 @@ pub fn encodeMessageNonce(outbound_index: u32, random_suffix: [8]u8) [12]u8 {
 const Entry = struct {
     ep: UdpEndpoint,
     session: CachedSession,
+    peer_handshake_initiator: bool,
     last_touch: u64,
+};
+
+pub const SessionLookup = struct {
+    session: *CachedSession,
+    peer_handshake_initiator: bool,
 };
 
 /// Bounded LRU table: least-recently touched entry is replaced when full.
@@ -94,10 +118,16 @@ pub const SessionTable = struct {
     }
 
     /// Inserts or updates a session for `ep`.
-    pub fn put(self: *SessionTable, ep: UdpEndpoint, session: CachedSession) std.mem.Allocator.Error!void {
+    pub fn put(
+        self: *SessionTable,
+        ep: UdpEndpoint,
+        sess: CachedSession,
+        peer_handshake_initiator: bool,
+    ) std.mem.Allocator.Error!void {
         for (self.entries.items) |*e| {
             if (ep.eql(e.ep)) {
-                e.session = session;
+                e.session = sess;
+                e.peer_handshake_initiator = peer_handshake_initiator;
                 e.last_touch = self.bump();
                 return;
             }
@@ -105,7 +135,12 @@ pub const SessionTable = struct {
 
         const touch = self.bump();
         if (self.entries.items.len < self.max_entries) {
-            try self.entries.append(self.allocator, .{ .ep = ep, .session = session, .last_touch = touch });
+            try self.entries.append(self.allocator, .{
+                .ep = ep,
+                .session = sess,
+                .peer_handshake_initiator = peer_handshake_initiator,
+                .last_touch = touch,
+            });
             return;
         }
 
@@ -117,15 +152,23 @@ pub const SessionTable = struct {
                 min_i = j;
             }
         }
-        self.entries.items[min_i] = .{ .ep = ep, .session = session, .last_touch = touch };
+        self.entries.items[min_i] = .{
+            .ep = ep,
+            .session = sess,
+            .peer_handshake_initiator = peer_handshake_initiator,
+            .last_touch = touch,
+        };
     }
 
     /// Returns the session for `ep` after marking it most-recently used, or `null`.
-    pub fn get(self: *SessionTable, ep: UdpEndpoint) ?*CachedSession {
+    pub fn get(self: *SessionTable, ep: UdpEndpoint) ?SessionLookup {
         for (self.entries.items) |*e| {
             if (ep.eql(e.ep)) {
                 e.last_touch = self.bump();
-                return &e.session;
+                return .{
+                    .session = &e.session,
+                    .peer_handshake_initiator = e.peer_handshake_initiator,
+                };
             }
         }
         return null;
@@ -194,12 +237,12 @@ test "SessionTable LRU eviction" {
     const sb = CachedSession{ .initiator_key = @splat(0xbb), .recipient_key = @splat(0), .outbound_nonce_counter = 0 };
     const sc = CachedSession{ .initiator_key = @splat(0xcc), .recipient_key = @splat(0), .outbound_nonce_counter = 0 };
 
-    try t.put(ep_a, sa);
-    try t.put(ep_b, sb);
+    try t.put(ep_a, sa, false);
+    try t.put(ep_b, sb, false);
     try std.testing.expectEqual(@as(usize, 2), t.count());
 
     _ = t.get(ep_a);
-    try t.put(ep_c, sc);
+    try t.put(ep_c, sc, false);
 
     try std.testing.expect(t.get(ep_a) != null);
     try std.testing.expect(t.get(ep_c) != null);

@@ -180,6 +180,124 @@ fn xorMaskRange(key: [16]u8, iv: [16]u8, buf: []u8, stream_byte_offset: usize) v
     }
 }
 
+pub fn writePlaintextStaticHeader(out: *[static_header_size]u8, flag: PacketFlag, nonce: [12]u8, auth_size: u16) void {
+    @memcpy(out[0..6], protocol_id);
+    std.mem.writeInt(u16, out[6..][0..2], 1, .big);
+    out[8] = @intFromEnum(flag);
+    @memcpy(out[9..21], &nonce);
+    std.mem.writeInt(u16, out[21..][0..2], auth_size, .big);
+}
+
+pub fn maskHeaderAndAuth(dest_node_id: [32]u8, iv: [16]u8, static_hdr: []u8, auth: []u8) void {
+    std.debug.assert(static_hdr.len == static_header_size);
+    const key = dest_node_id[0..16].*;
+    xorMaskRange(key, iv, static_hdr, 0);
+    xorMaskRange(key, iv, auth, static_header_size);
+}
+
+pub const EncodeError = error{ BadHandshakeAuthSizes, AuthSizeTooLarge } || std.mem.Allocator.Error;
+
+pub fn allocWhoareyouChallengeData(
+    allocator: std.mem.Allocator,
+    iv: [16]u8,
+    echo_message_nonce: [12]u8,
+    id_nonce: [16]u8,
+    enr_seq: u64,
+) std.mem.Allocator.Error![]u8 {
+    const n = static_prefix_size + whoareyou_auth_size;
+    const out = try allocator.alloc(u8, n);
+    @memcpy(out[0..16], &iv);
+    var static_plain: [static_header_size]u8 = undefined;
+    writePlaintextStaticHeader(&static_plain, .whoareyou, echo_message_nonce, whoareyou_auth_size);
+    @memcpy(out[16..][0..static_header_size], &static_plain);
+    const auth_off = static_prefix_size;
+    @memcpy(out[auth_off..][0..16], &id_nonce);
+    std.mem.writeInt(u64, out[auth_off + 16 ..][0..8], enr_seq, .big);
+    return out;
+}
+
+pub fn encodeWhoareyouPacket(
+    allocator: std.mem.Allocator,
+    dest_node_id: [32]u8,
+    iv: [16]u8,
+    echo_message_nonce: [12]u8,
+    id_nonce: [16]u8,
+    enr_seq: u64,
+) EncodeError![]u8 {
+    const auth_len = whoareyou_auth_size;
+    const total_len = static_prefix_size + auth_len;
+    const out = try allocator.alloc(u8, total_len);
+    errdefer allocator.free(out);
+    @memcpy(out[0..16], &iv);
+    var static_plain: [static_header_size]u8 = undefined;
+    writePlaintextStaticHeader(&static_plain, .whoareyou, echo_message_nonce, auth_len);
+    @memcpy(out[16..][0..static_header_size], &static_plain);
+    const auth_off = static_prefix_size;
+    @memcpy(out[auth_off..][0..16], &id_nonce);
+    std.mem.writeInt(u64, out[auth_off + 16 ..][0..8], enr_seq, .big);
+    maskHeaderAndAuth(dest_node_id, iv, out[16..][0..static_header_size], out[auth_off..][0..auth_len]);
+    return out;
+}
+
+pub fn encodeOrdinaryMessagePacket(
+    allocator: std.mem.Allocator,
+    dest_node_id: [32]u8,
+    iv: [16]u8,
+    nonce: [12]u8,
+    src_id: [32]u8,
+    message_cipher_and_tag: []const u8,
+) EncodeError![]u8 {
+    const auth_len = message_auth_size;
+    const total_len = static_prefix_size + auth_len + message_cipher_and_tag.len;
+    const out = try allocator.alloc(u8, total_len);
+    errdefer allocator.free(out);
+    @memcpy(out[0..16], &iv);
+    var static_plain: [static_header_size]u8 = undefined;
+    writePlaintextStaticHeader(&static_plain, .message, nonce, auth_len);
+    @memcpy(out[16..][0..static_header_size], &static_plain);
+    const auth_off = static_prefix_size;
+    @memcpy(out[auth_off..][0..auth_len], &src_id);
+    @memcpy(out[auth_off + auth_len ..], message_cipher_and_tag);
+    maskHeaderAndAuth(dest_node_id, iv, out[16..][0..static_header_size], out[auth_off..][0..auth_len]);
+    return out;
+}
+
+pub fn encodeHandshakePacket(
+    allocator: std.mem.Allocator,
+    dest_node_id: [32]u8,
+    iv: [16]u8,
+    nonce: [12]u8,
+    src_id: [32]u8,
+    sig_size: u8,
+    eph_key_size: u8,
+    signature: []const u8,
+    eph_pubkey: []const u8,
+    record: []const u8,
+    message_cipher_and_tag: []const u8,
+) EncodeError![]u8 {
+    if (signature.len != sig_size or eph_pubkey.len != eph_key_size) return error.BadHandshakeAuthSizes;
+    const auth_len = handshake_auth_head_size + signature.len + eph_pubkey.len + record.len;
+    const auth_size_u16 = std.math.cast(u16, auth_len) orelse return error.AuthSizeTooLarge;
+    const total_len = static_prefix_size + auth_len + message_cipher_and_tag.len;
+    const out = try allocator.alloc(u8, total_len);
+    errdefer allocator.free(out);
+    @memcpy(out[0..16], &iv);
+    var static_plain: [static_header_size]u8 = undefined;
+    writePlaintextStaticHeader(&static_plain, .handshake, nonce, auth_size_u16);
+    @memcpy(out[16..][0..static_header_size], &static_plain);
+    const auth_off = static_prefix_size;
+    const auth = out[auth_off..][0..auth_len];
+    @memcpy(auth[0..32], &src_id);
+    auth[32] = sig_size;
+    auth[33] = eph_key_size;
+    @memcpy(auth[34 .. 34 + signature.len], signature);
+    @memcpy(auth[34 + signature.len ..][0..eph_pubkey.len], eph_pubkey);
+    @memcpy(auth[34 + signature.len + eph_pubkey.len ..], record);
+    @memcpy(out[auth_off + auth_len ..], message_cipher_and_tag);
+    maskHeaderAndAuth(dest_node_id, iv, out[16..][0..static_header_size], auth);
+    return out;
+}
+
 test "xorMaskRange matches std.crypto.core.modes.ctr for contiguous range" {
     const modes = std.crypto.core.modes;
     const key = [_]u8{ 0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c };
@@ -323,4 +441,30 @@ test "parse handshake auth rejects truncated" {
 
 test "wrong message auth size" {
     try std.testing.expectError(error.WrongAuthSize, parseMessageAuth(&[_]u8{0} ** 31));
+}
+
+test "encode WHOAREYOU roundtrip decodeInPlace" {
+    const alloc = std.testing.allocator;
+
+    var dest_id: [32]u8 = undefined;
+    @memset(&dest_id, 0x37);
+
+    var iv: [16]u8 = undefined;
+    @memset(&iv, 0x55);
+    const echo_nonce = [_]u8{0x01} ** 12;
+    var id_nonce: [16]u8 = undefined;
+    @memset(&id_nonce, 0x66);
+
+    const enc = try encodeWhoareyouPacket(alloc, dest_id, iv, echo_nonce, id_nonce, 0x8899aabbccddeeff);
+    defer alloc.free(enc);
+
+    const dec_buf = try alloc.dupe(u8, enc);
+    defer alloc.free(dec_buf);
+
+    const parsed = try decodeInPlace(&dest_id, dec_buf);
+    try std.testing.expect(parsed.header.flag == .whoareyou);
+    try std.testing.expectEqualSlices(u8, &echo_nonce, &parsed.header.nonce);
+    const body = try parsed.decodeAuth();
+    try std.testing.expectEqual(@as(u64, 0x8899aabbccddeeff), body.whoareyou.enr_seq);
+    try std.testing.expectEqualSlices(u8, &id_nonce, &body.whoareyou.id_nonce);
 }

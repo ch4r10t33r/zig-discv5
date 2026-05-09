@@ -12,6 +12,8 @@ pub const Error = error{
     BadSignatureLength,
     BadSequenceEncoding,
     UnpairedEntry,
+    MalformedPair,
+    MissingSecp256k1Key,
 } || std.base64.Error || rlp.Error;
 
 pub const RecordPayload = struct {
@@ -72,6 +74,27 @@ fn verifyPairsPayload(payload: []const u8) Error!void {
         rest = rest[d.len..];
     }
     if (count % 2 != 0) return error.UnpairedEntry;
+}
+
+/// Returns the compressed secp256k1 public key (33 bytes) from ENR `pairs_payload` (post-signature RLP tail).
+pub fn compressedSecp256k1Pubkey(pairs_payload: []const u8) Error![33]u8 {
+    var rest = pairs_payload;
+    while (rest.len > 0) {
+        const k = try rlp.decodeFirst(rest);
+        if (k.item != .string) return error.MalformedPair;
+        rest = rest[k.len..];
+        const v = try rlp.decodeFirst(rest);
+        if (v.item != .string) return error.MalformedPair;
+        rest = rest[v.len..];
+
+        if (std.mem.eql(u8, k.item.string, "secp256k1")) {
+            if (v.item.string.len != 33) return error.MalformedPair;
+            var out: [33]u8 = undefined;
+            @memcpy(&out, v.item.string);
+            return out;
+        }
+    }
+    return error.MissingSecp256k1Key;
 }
 
 const decoder = std.base64.url_safe_no_pad.Decoder;
