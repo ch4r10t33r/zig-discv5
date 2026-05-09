@@ -12,7 +12,7 @@ The layout is modular; several areas are still stubs (`NotImplemented`) while pr
 | Varint | `varint` | Unsigned LEB128 (`u64`), minimal encoding, strict decode |
 | RLP | `rlp` | Strings and lists for devp2p payloads |
 | Wire | `wire` | `MessageKind`, `varint`, `packet`, `message`, `message_crypto` |
-| Message | `message` | Ordinary message RLP encode/decode (ping/pong/findnode/nodes/talk) |
+| Message | `message` | Ordinary message RLP encode/decode (ping/pong/findnode/nodes/talk; REGTOPIC/TICKET/REGCONFIRMATION/TOPICQUERY are experimental per wire spec) |
 | Message crypto | `message_crypto` | AES-128-GCM for ordinary message ciphertext (spec section 2.3) |
 | ENR | `enr` | EIP-778 textual `enr:` decode (base64url + RLP layout checks) |
 | Handshake | `handshake` (alias `crypto`) | HKDF session keys, identity-proof SHA-256 |
@@ -20,7 +20,7 @@ The layout is modular; several areas are still stubs (`NotImplemented`) while pr
 | Packet | `packet` | UDP bounds, header unmask, static header + auth layouts |
 | Routing | `routing` | Kademlia table: 256 buckets (k=16), per-bucket replacement cache, LRU/MRU, closest + FINDNODE export |
 | Session | `session` | LRU session table (node id + UDP endpoint), cached keys, GCM nonce helper |
-| Topic | `topic` | Topic ads / search (stub) |
+| Topic | `topic` | Topic table per discv5-theory: FIFO queues, per-topic and global caps, `target_ad_lifetime` purge, registration wait hints |
 | Node | `node` | Local node runtime (stub) |
 
 ## Requirements

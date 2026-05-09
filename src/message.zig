@@ -9,6 +9,11 @@ pub const type_findnode: u8 = 0x03;
 pub const type_nodes: u8 = 0x04;
 pub const type_talkreq: u8 = 0x05;
 pub const type_talkresp: u8 = 0x06;
+/// Experimental / non-final in discv5-wire — decode and encode for completeness only.
+pub const type_regtopic: u8 = 0x07;
+pub const type_ticket: u8 = 0x08;
+pub const type_regconfirmation: u8 = 0x09;
+pub const type_topicquery: u8 = 0x0a;
 
 pub const Error = error{
     EmptyPlaintext,
@@ -62,6 +67,29 @@ pub const TalkResponse = struct {
     response: []const u8,
 };
 
+pub const Regtopic = struct {
+    req_id: []const u8,
+    topic: []const u8,
+    enr: []const u8,
+    ticket: []const u8,
+};
+
+pub const TicketResponse = struct {
+    req_id: []const u8,
+    opaque_ticket: []const u8,
+    wait_time_secs: u64,
+};
+
+pub const Regconfirmation = struct {
+    req_id: []const u8,
+    topic: []const u8,
+};
+
+pub const Topicquery = struct {
+    req_id: []const u8,
+    topic: []const u8,
+};
+
 pub const DecodedMessage = union(enum) {
     ping: Ping,
     pong: Pong,
@@ -69,6 +97,10 @@ pub const DecodedMessage = union(enum) {
     nodes: Nodes,
     talkreq: TalkRequest,
     talkresp: TalkResponse,
+    regtopic: Regtopic,
+    ticket: TicketResponse,
+    regconfirmation: Regconfirmation,
+    topicquery: Topicquery,
 
     pub fn deinit(self: *const DecodedMessage, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -125,6 +157,10 @@ pub fn decodePlaintext(plaintext: []const u8, allocator: std.mem.Allocator) (Dec
         type_nodes => .{ .nodes = try decodeNodes(allocator, body) },
         type_talkreq => .{ .talkreq = try decodeTalkRequest(body) },
         type_talkresp => .{ .talkresp = try decodeTalkResponse(body) },
+        type_regtopic => .{ .regtopic = try decodeRegtopic(body) },
+        type_ticket => .{ .ticket = try decodeTicketResponse(body) },
+        type_regconfirmation => .{ .regconfirmation = try decodeRegconfirmation(body) },
+        type_topicquery => .{ .topicquery = try decodeTopicquery(body) },
         else => error.UnknownKind,
     };
 }
@@ -263,6 +299,91 @@ fn decodeTalkRequest(body: []const u8) DecodeError!TalkRequest {
     if (e2.len != rest.len) return error.TrailingGarbage;
 
     return .{ .req_id = req_id, .protocol = proto, .message = msg };
+}
+
+fn decodeRegtopic(body: []const u8) DecodeError!Regtopic {
+    const top = try rlp.decodeFirst(body);
+    const list_payload = try requireList(top.item);
+    if (top.len != body.len) return error.TrailingGarbage;
+
+    var rest = list_payload;
+    const e0 = try rlp.decodeFirst(rest);
+    const req_id = try requireString(e0.item);
+    if (req_id.len > 8) return error.RequestIdTooLong;
+    rest = rest[e0.len..];
+
+    const e1 = try rlp.decodeFirst(rest);
+    const topic = try requireString(e1.item);
+    rest = rest[e1.len..];
+
+    const e2 = try rlp.decodeFirst(rest);
+    const enr = try requireString(e2.item);
+    rest = rest[e2.len..];
+
+    const e3 = try rlp.decodeFirst(rest);
+    const ticket = try requireString(e3.item);
+    if (e3.len != rest.len) return error.TrailingGarbage;
+
+    return .{ .req_id = req_id, .topic = topic, .enr = enr, .ticket = ticket };
+}
+
+fn decodeTicketResponse(body: []const u8) DecodeError!TicketResponse {
+    const top = try rlp.decodeFirst(body);
+    const list_payload = try requireList(top.item);
+    if (top.len != body.len) return error.TrailingGarbage;
+
+    var rest = list_payload;
+    const e0 = try rlp.decodeFirst(rest);
+    const req_id = try requireString(e0.item);
+    if (req_id.len > 8) return error.RequestIdTooLong;
+    rest = rest[e0.len..];
+
+    const e1 = try rlp.decodeFirst(rest);
+    const opaque_ticket = try requireString(e1.item);
+    rest = rest[e1.len..];
+
+    const e2 = try rlp.decodeFirst(rest);
+    const wts = try requireString(e2.item);
+    if (e2.len != rest.len) return error.TrailingGarbage;
+    const wait_time_secs = try rlpUintToU64(wts);
+
+    return .{ .req_id = req_id, .opaque_ticket = opaque_ticket, .wait_time_secs = wait_time_secs };
+}
+
+fn decodeRegconfirmation(body: []const u8) DecodeError!Regconfirmation {
+    const top = try rlp.decodeFirst(body);
+    const list_payload = try requireList(top.item);
+    if (top.len != body.len) return error.TrailingGarbage;
+
+    var rest = list_payload;
+    const e0 = try rlp.decodeFirst(rest);
+    const req_id = try requireString(e0.item);
+    if (req_id.len > 8) return error.RequestIdTooLong;
+    rest = rest[e0.len..];
+
+    const e1 = try rlp.decodeFirst(rest);
+    const topic = try requireString(e1.item);
+    if (e1.len != rest.len) return error.TrailingGarbage;
+
+    return .{ .req_id = req_id, .topic = topic };
+}
+
+fn decodeTopicquery(body: []const u8) DecodeError!Topicquery {
+    const top = try rlp.decodeFirst(body);
+    const list_payload = try requireList(top.item);
+    if (top.len != body.len) return error.TrailingGarbage;
+
+    var rest = list_payload;
+    const e0 = try rlp.decodeFirst(rest);
+    const req_id = try requireString(e0.item);
+    if (req_id.len > 8) return error.RequestIdTooLong;
+    rest = rest[e0.len..];
+
+    const e1 = try rlp.decodeFirst(rest);
+    const topic = try requireString(e1.item);
+    if (e1.len != rest.len) return error.TrailingGarbage;
+
+    return .{ .req_id = req_id, .topic = topic };
 }
 
 fn decodeTalkResponse(body: []const u8) DecodeError!TalkResponse {
@@ -414,6 +535,76 @@ pub fn encodeTalkResponsePlaintext(allocator: std.mem.Allocator, req_id: []const
     return out;
 }
 
+pub fn encodeRegtopicPlaintext(
+    allocator: std.mem.Allocator,
+    req_id: []const u8,
+    topic: []const u8,
+    enr: []const u8,
+    ticket: []const u8,
+) std.mem.Allocator.Error![]u8 {
+    var inner: std.ArrayList(u8) = .empty;
+    defer inner.deinit(allocator);
+    try rlp.appendString(&inner, allocator, req_id);
+    try rlp.appendString(&inner, allocator, topic);
+    try rlp.appendString(&inner, allocator, enr);
+    try rlp.appendString(&inner, allocator, ticket);
+    var outer: std.ArrayList(u8) = .empty;
+    defer outer.deinit(allocator);
+    try rlp.appendListPayload(&outer, allocator, inner.items);
+    const out = try allocator.alloc(u8, 1 + outer.items.len);
+    out[0] = type_regtopic;
+    @memcpy(out[1..], outer.items);
+    return out;
+}
+
+pub fn encodeTicketResponsePlaintext(
+    allocator: std.mem.Allocator,
+    req_id: []const u8,
+    opaque_ticket: []const u8,
+    wait_time_secs: u64,
+) std.mem.Allocator.Error![]u8 {
+    var inner: std.ArrayList(u8) = .empty;
+    defer inner.deinit(allocator);
+    try rlp.appendString(&inner, allocator, req_id);
+    try rlp.appendString(&inner, allocator, opaque_ticket);
+    try appendMinimalU64(&inner, allocator, wait_time_secs);
+    var outer: std.ArrayList(u8) = .empty;
+    defer outer.deinit(allocator);
+    try rlp.appendListPayload(&outer, allocator, inner.items);
+    const out = try allocator.alloc(u8, 1 + outer.items.len);
+    out[0] = type_ticket;
+    @memcpy(out[1..], outer.items);
+    return out;
+}
+
+pub fn encodeRegconfirmationPlaintext(allocator: std.mem.Allocator, req_id: []const u8, topic: []const u8) std.mem.Allocator.Error![]u8 {
+    var inner: std.ArrayList(u8) = .empty;
+    defer inner.deinit(allocator);
+    try rlp.appendString(&inner, allocator, req_id);
+    try rlp.appendString(&inner, allocator, topic);
+    var outer: std.ArrayList(u8) = .empty;
+    defer outer.deinit(allocator);
+    try rlp.appendListPayload(&outer, allocator, inner.items);
+    const out = try allocator.alloc(u8, 1 + outer.items.len);
+    out[0] = type_regconfirmation;
+    @memcpy(out[1..], outer.items);
+    return out;
+}
+
+pub fn encodeTopicqueryPlaintext(allocator: std.mem.Allocator, req_id: []const u8, topic: []const u8) std.mem.Allocator.Error![]u8 {
+    var inner: std.ArrayList(u8) = .empty;
+    defer inner.deinit(allocator);
+    try rlp.appendString(&inner, allocator, req_id);
+    try rlp.appendString(&inner, allocator, topic);
+    var outer: std.ArrayList(u8) = .empty;
+    defer outer.deinit(allocator);
+    try rlp.appendListPayload(&outer, allocator, inner.items);
+    const out = try allocator.alloc(u8, 1 + outer.items.len);
+    out[0] = type_topicquery;
+    @memcpy(out[1..], outer.items);
+    return out;
+}
+
 test "ping roundtrip" {
     const alloc = std.testing.allocator;
     const enc = try encodePingPlaintext(alloc, &.{ 0x01, 0x02 }, 42);
@@ -474,4 +665,35 @@ test "nodes talk roundtrip" {
     defer dec_r.deinit(alloc);
     try std.testing.expect(dec_r == .talkresp);
     try std.testing.expectEqualStrings("ok", dec_r.talkresp.response);
+}
+
+test "topic wire roundtrip" {
+    const alloc = std.testing.allocator;
+
+    const th = [_]u8{0xbb} ** 32;
+    const enc_r = try encodeRegtopicPlaintext(alloc, &.{0x01}, &th, "enr-bytes", "");
+    defer alloc.free(enc_r);
+    const dec_r = try decodePlaintext(enc_r, alloc);
+    defer dec_r.deinit(alloc);
+    try std.testing.expect(dec_r == .regtopic);
+    try std.testing.expectEqualSlices(u8, &th, dec_r.regtopic.topic);
+
+    const enc_t = try encodeTicketResponsePlaintext(alloc, &.{0x02}, &.{ 0xab, 0xcd }, 3600);
+    defer alloc.free(enc_t);
+    const dec_t = try decodePlaintext(enc_t, alloc);
+    defer dec_t.deinit(alloc);
+    try std.testing.expect(dec_t == .ticket);
+    try std.testing.expectEqual(@as(u64, 3600), dec_t.ticket.wait_time_secs);
+
+    const enc_c = try encodeRegconfirmationPlaintext(alloc, &.{0x03}, &th);
+    defer alloc.free(enc_c);
+    const dec_c = try decodePlaintext(enc_c, alloc);
+    defer dec_c.deinit(alloc);
+    try std.testing.expect(dec_c == .regconfirmation);
+
+    const enc_q = try encodeTopicqueryPlaintext(alloc, &.{0x04}, &th);
+    defer alloc.free(enc_q);
+    const dec_q = try decodePlaintext(enc_q, alloc);
+    defer dec_q.deinit(alloc);
+    try std.testing.expect(dec_q == .topicquery);
 }
