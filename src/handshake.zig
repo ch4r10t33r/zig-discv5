@@ -1,5 +1,5 @@
 //! Handshake key derivation and identity proof hashing per [discv5-theory](https://github.com/ethereum/devp2p/blob/master/discv5/discv5-theory.md).
-//! ECDH and secp256k1 signing are left to the caller; inputs match post-ECDH layout (`eph` in go-ethereum `p2p/discover/v5wire`).
+//! ECDH and ECDSA for the identity proof are implemented in `identity_v4.zig` alongside compressed pubkeys.
 //!
 //! Exported as `handshake` from the package root; `crypto` is a public alias of the same module.
 

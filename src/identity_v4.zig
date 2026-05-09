@@ -1,8 +1,18 @@
-//! secp256k1 "v4" identity helpers for discv5: compressed public keys and ECDH shared secret encoding
-//! per [discv5-theory](https://github.com/ethereum/devp2p/blob/master/discv5/discv5-theory.md) (same as go-ethereum `ecdh`).
+//! secp256k1 "v4" identity helpers for discv5: compressed public keys, ECDH shared secret (`eph`),
+//! and ECDSA over **handshake.hashIdentityProof** (64-byte `r || s` on the wire).
+//!
+//! Matches [discv5-theory](https://github.com/ethereum/devp2p/blob/master/discv5/discv5-theory.md) and go-ethereum `v5wire` (`ecdh`, `makeIDSignature`, `verifyIDSignature`).
 
 const std = @import("std");
 const Secp256k1 = std.crypto.ecc.Secp256k1;
+
+const EcdsaV4 = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256;
+
+pub const IdentityProofSignError = std.crypto.errors.IdentityElementError || std.crypto.errors.NonCanonicalError;
+
+pub const IdentityProofVerifyError = EcdsaV4.Signature.VerifyError ||
+    std.crypto.errors.EncodingError ||
+    std.crypto.errors.NotSquareError;
 
 pub const EcdhError = std.crypto.errors.IdentityElementError ||
     std.crypto.errors.EncodingError ||
@@ -30,6 +40,56 @@ pub fn ecdhLocalSecret(remote_compressed_pubkey: [33]u8, local_secret_key: [32]u
     const remote = try Secp256k1.fromSec1(&remote_compressed_pubkey);
     const shared = try remote.mul(local_secret_key, .big);
     return compressJacobian(shared);
+}
+
+/// Signs `sha256_digest`, the 32-byte output of **handshake.hashIdentityProof**, using the static secp256k1 key.
+/// `noise` may be null for deterministic ECDSA; otherwise supply 32 random bytes (recommended for fault resistance).
+pub fn signIdentityProofHash(
+    sha256_digest: [32]u8,
+    secret_key: [32]u8,
+    noise: ?[32]u8,
+) IdentityProofSignError![64]u8 {
+    const sk = try EcdsaV4.SecretKey.fromBytes(secret_key);
+    const kp = try EcdsaV4.KeyPair.fromSecretKey(sk);
+    const sig = try kp.signPrehashed(sha256_digest, noise);
+    return sig.toBytes();
+}
+
+/// Verifies a 64-byte `r || s` signature (big-endian) against the identity-proof hash and compressed public key.
+pub fn verifyIdentityProofHash(
+    signature_rs: [64]u8,
+    sha256_digest: [32]u8,
+    static_public_compressed: [33]u8,
+) IdentityProofVerifyError!void {
+    const pk = try EcdsaV4.PublicKey.fromSec1(&static_public_compressed);
+    const sig = EcdsaV4.Signature.fromBytes(signature_rs);
+    try sig.verifyPrehashed(sha256_digest, pk);
+}
+
+/// Hashes the identity proof preimage (**handshake.hashIdentityProof**) then signs it.
+pub fn signIdentityProof(
+    challenge_data: []const u8,
+    ephemeral_pubkey: []const u8,
+    recipient_node_id: [32]u8,
+    secret_key: [32]u8,
+    noise: ?[32]u8,
+) IdentityProofSignError![64]u8 {
+    const handshake = @import("handshake.zig");
+    const h = handshake.hashIdentityProof(challenge_data, ephemeral_pubkey, recipient_node_id);
+    return signIdentityProofHash(h, secret_key, noise);
+}
+
+/// Verifies **signIdentityProof** output for the given preimage fields.
+pub fn verifyIdentityProof(
+    signature_rs: [64]u8,
+    challenge_data: []const u8,
+    ephemeral_pubkey: []const u8,
+    recipient_node_id: [32]u8,
+    static_public_compressed: [33]u8,
+) IdentityProofVerifyError!void {
+    const handshake = @import("handshake.zig");
+    const h = handshake.hashIdentityProof(challenge_data, ephemeral_pubkey, recipient_node_id);
+    try verifyIdentityProofHash(signature_rs, h, static_public_compressed);
 }
 
 test "compressed pubkey and ECDH symmetry" {
@@ -75,4 +135,21 @@ test "ECDH feeds handshake deriveSessionKeys" {
     const keys_b = handshake.deriveSessionKeys(&ikm_b, &challenge, n1, n2);
     try std.testing.expectEqualSlices(u8, &keys_a.initiator_key, &keys_b.initiator_key);
     try std.testing.expectEqualSlices(u8, &keys_a.recipient_key, &keys_b.recipient_key);
+}
+
+test "identity proof ECDSA roundtrip" {
+    var sk: [32]u8 = @splat(0);
+    sk[31] = 11;
+
+    const pk = try compressedPubkeyFromSecretKey(sk);
+    const challenge = [_]u8{0xab} ** 16;
+    const eph = [_]u8{0x02} ++ [_]u8{0xcd} ** 32;
+    const recipient = [_]u8{0x42} ** 32;
+
+    const sig = try signIdentityProof(&challenge, &eph, recipient, sk, null);
+    try verifyIdentityProof(sig, &challenge, &eph, recipient, pk);
+
+    var wrong: [32]u8 = recipient;
+    wrong[0] +%= 1;
+    try std.testing.expectError(error.SignatureVerificationFailed, verifyIdentityProof(sig, &challenge, &eph, wrong, pk));
 }
