@@ -11,7 +11,9 @@ The layout is modular; several areas are still stubs (`NotImplemented`) while pr
 | Shared errors | `errors` | Common error sets |
 | Varint | `varint` | Unsigned LEB128 (`u64`), minimal encoding, strict decode |
 | RLP | `rlp` | Strings and lists for devp2p payloads |
-| Wire | `wire` | `MessageKind`, `varint`, `packet`; RLP message bodies (stub) |
+| Wire | `wire` | `MessageKind`, `varint`, `packet`, `message`, `message_crypto` |
+| Message | `message` | Ordinary message RLP encode/decode (ping/pong/findnode/nodes/talk) |
+| Message crypto | `message_crypto` | AES-128-GCM for ordinary message ciphertext (spec section 2.3) |
 | ENR | `enr` | EIP-778 textual `enr:` decode (base64url + RLP layout checks) |
 | Crypto | `crypto` | Session / handshake crypto (stub) |
 | Packet | `packet` | UDP bounds, header unmask, static header + auth layouts |
