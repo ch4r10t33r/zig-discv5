@@ -1,4 +1,4 @@
-//! Pure Zig [Node Discovery Protocol v5](https://github.com/ethereum/devp2p/blob/master/discv5/discv5.md) implementation (stub).
+//! Pure Zig [Node Discovery Protocol v5](https://github.com/ethereum/devp2p/blob/master/discv5/discv5.md) implementation.
 //!
 //! Requires Zig 0.16.0 or later.
 
