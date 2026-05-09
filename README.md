@@ -11,10 +11,10 @@ The layout is modular; several areas are still stubs (`NotImplemented`) while pr
 | Shared errors | `errors` | Common error sets |
 | Varint | `varint` | Unsigned LEB128 (`u64`), minimal encoding, strict decode |
 | RLP | `rlp` | Strings and lists for devp2p payloads |
-| Wire | `wire` | Message framing (stub) |
+| Wire | `wire` | Re-exports framing helpers (`varint`, `packet`); message RLP (stub) |
 | ENR | `enr` | EIP-778 textual `enr:` decode (base64url + RLP layout checks) |
 | Crypto | `crypto` | Session / handshake crypto (stub) |
-| Packet | `packet` | UDP packet layout (stub) |
+| Packet | `packet` | UDP bounds, AES-128-CTR header unmask, static header parse |
 | Routing | `routing` | Kademlia table (stub) |
 | Topic | `topic` | Topic ads / search (stub) |
 | Node | `node` | Local node runtime (stub) |
