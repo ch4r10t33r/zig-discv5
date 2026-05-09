@@ -8,6 +8,8 @@ pub const packet = @import("packet.zig");
 pub const message = @import("message.zig");
 pub const message_crypto = @import("message_crypto.zig");
 pub const routing = @import("routing.zig");
+pub const handshake = @import("handshake.zig");
+pub const crypto = handshake;
 
 /// First byte of decrypted `message-pt` (`message-type` in discv5-wire).
 pub const MessageKind = enum(u8) {

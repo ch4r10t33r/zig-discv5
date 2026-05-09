@@ -7,7 +7,9 @@ pub const varint = @import("varint.zig");
 pub const rlp = @import("rlp.zig");
 pub const wire = @import("wire.zig");
 pub const enr = @import("enr.zig");
-pub const crypto = @import("crypto.zig");
+pub const handshake = @import("handshake.zig");
+/// Same module as `handshake`; kept for discoverability next to `message_crypto`.
+pub const crypto = handshake;
 pub const packet = @import("packet.zig");
 pub const message = @import("message.zig");
 pub const message_crypto = @import("message_crypto.zig");
@@ -21,6 +23,7 @@ test {
     _ = rlp;
     _ = wire;
     _ = enr;
+    _ = handshake;
     _ = crypto;
     _ = packet;
     _ = message;
