@@ -18,7 +18,7 @@ The layout is modular; several areas are still stubs (`NotImplemented`) while pr
 | Handshake | `handshake` (alias `crypto`) | HKDF session keys, identity-proof SHA-256 |
 | Identity v4 | `identity_v4` | Compressed pubkey, ECDH (`eph`), ECDSA identity proof (64-byte raw signature) |
 | Packet | `packet` | UDP bounds, header unmask, static header + auth layouts |
-| Routing | `routing` | Kademlia table: XOR / log distance, 256 buckets, k=16, LRU/MRU, closest + FINDNODE bucket export |
+| Routing | `routing` | Kademlia table: 256 buckets (k=16), per-bucket replacement cache, LRU/MRU, closest + FINDNODE export |
 | Session | `session` | LRU session table (node id + UDP endpoint), cached keys, GCM nonce helper |
 | Topic | `topic` | Topic ads / search (stub) |
 | Node | `node` | Local node runtime (stub) |
