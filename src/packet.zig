@@ -21,7 +21,6 @@ pub const PacketFlag = enum(u8) {
     message = 0,
     whoareyou = 1,
     handshake = 2,
-    _,
 
     pub fn parse(b: u8) ?PacketFlag {
         return switch (b) {
@@ -41,6 +40,8 @@ pub const Error = error{
     UnknownFlag,
     AuthBeyondPacket,
     MessageTooShort,
+    WrongAuthSize,
+    InvalidHandshakeAuth,
 };
 
 pub const StaticHeader = struct {
@@ -56,7 +57,83 @@ pub const ParsedPacket = struct {
     auth_data: []u8,
     /// Ciphertext + tag after the header (may be empty for WHOAREYOU).
     message_cipher: []u8,
+
+    /// Decodes `auth_data` according to `header.flag`.
+    pub fn decodeAuth(self: *const ParsedPacket) Error!AuthBody {
+        return switch (self.header.flag) {
+            .message => .{ .message = try parseMessageAuth(self.auth_data) },
+            .whoareyou => .{ .whoareyou = try parseWhoareyouAuth(self.auth_data) },
+            .handshake => .{ .handshake = try parseHandshakeAuth(self.auth_data) },
+        };
+    }
 };
+
+/// Fixed auth sizes from [discv5-wire](https://github.com/ethereum/devp2p/blob/master/discv5/discv5-wire.md).
+pub const message_auth_size: usize = 32;
+pub const whoareyou_auth_size: usize = 16 + 8;
+pub const handshake_auth_head_size: usize = 32 + 1 + 1;
+
+pub const MessageAuth = struct {
+    src_id: [32]u8,
+};
+
+pub const WhoareyouAuth = struct {
+    id_nonce: [16]u8,
+    enr_seq: u64,
+};
+
+/// Handshake `authdata` after the fixed head: signature, ephemeral pubkey, optional ENR bytes.
+pub const HandshakeAuth = struct {
+    src_id: [32]u8,
+    sig_size: u8,
+    eph_key_size: u8,
+    signature: []const u8,
+    eph_pubkey: []const u8,
+    record: []const u8,
+};
+
+pub const AuthBody = union(enum) {
+    message: MessageAuth,
+    whoareyou: WhoareyouAuth,
+    handshake: HandshakeAuth,
+};
+
+pub fn parseMessageAuth(data: []const u8) Error!MessageAuth {
+    if (data.len != message_auth_size) return error.WrongAuthSize;
+    var src_id: [32]u8 = undefined;
+    @memcpy(&src_id, data[0..32]);
+    return .{ .src_id = src_id };
+}
+
+pub fn parseWhoareyouAuth(data: []const u8) Error!WhoareyouAuth {
+    if (data.len != whoareyou_auth_size) return error.WrongAuthSize;
+    var id_nonce: [16]u8 = undefined;
+    @memcpy(&id_nonce, data[0..16]);
+    const enr_seq = std.mem.readInt(u64, data[16..][0..8], .big);
+    return .{ .id_nonce = id_nonce, .enr_seq = enr_seq };
+}
+
+pub fn parseHandshakeAuth(data: []const u8) Error!HandshakeAuth {
+    if (data.len < handshake_auth_head_size) return error.PacketTooShort;
+    var src_id: [32]u8 = undefined;
+    @memcpy(&src_id, data[0..32]);
+    const sig_size = data[32];
+    const eph_key_size = data[33];
+    const rest_len = data.len - handshake_auth_head_size;
+    const need = @as(usize, sig_size) + @as(usize, eph_key_size);
+    if (rest_len < need) return error.InvalidHandshakeAuth;
+    const sig_off = handshake_auth_head_size;
+    const pk_off = sig_off + sig_size;
+    const end_keys = pk_off + eph_key_size;
+    return .{
+        .src_id = src_id,
+        .sig_size = sig_size,
+        .eph_key_size = eph_key_size,
+        .signature = data[sig_off..pk_off],
+        .eph_pubkey = data[pk_off..end_keys],
+        .record = data[end_keys..],
+    };
+}
 
 /// XOR `buf` with the discv5 header keystream starting at `stream_byte_offset` from the IV.
 fn xorMaskRange(key: [16]u8, iv: [16]u8, buf: []u8, stream_byte_offset: usize) void {
@@ -201,4 +278,49 @@ test "whoareyou minimum packet roundtrip mask" {
     try std.testing.expectEqual(@as(u16, 24), dec.header.auth_size);
     try std.testing.expectEqualSlices(u8, &auth_plain, dec.auth_data);
     try std.testing.expectEqual(@as(usize, 0), dec.message_cipher.len);
+
+    const auth = try dec.decodeAuth();
+    try std.testing.expect(auth == .whoareyou);
+    try std.testing.expectEqual(@as(u64, 0xcccccccccccccccc), auth.whoareyou.enr_seq);
+}
+
+test "parse message auth" {
+    var buf: [32]u8 = undefined;
+    for (&buf, 0..) |*b, i| b.* = @truncate(i);
+
+    const a = try parseMessageAuth(&buf);
+    try std.testing.expectEqualSlices(u8, &buf, &a.src_id);
+}
+
+test "parse whoareyou auth endian" {
+    var buf: [24]u8 = undefined;
+    @memset(&buf, 0);
+    std.mem.writeInt(u64, buf[16..][0..8], 0x0102030405060708, .big);
+
+    const a = try parseWhoareyouAuth(&buf);
+    try std.testing.expectEqual(@as(u64, 0x0102030405060708), a.enr_seq);
+}
+
+test "parse handshake auth v4 layout" {
+    var buf: [34 + 64 + 33]u8 = undefined;
+    @memset(&buf, 0xee);
+    buf[32] = 64;
+    buf[33] = 33;
+
+    const a = try parseHandshakeAuth(&buf);
+    try std.testing.expectEqual(@as(usize, 64), a.signature.len);
+    try std.testing.expectEqual(@as(usize, 33), a.eph_pubkey.len);
+    try std.testing.expectEqual(@as(usize, 0), a.record.len);
+}
+
+test "parse handshake auth rejects truncated" {
+    var buf: [40]u8 = undefined;
+    @memset(&buf, 0);
+    buf[32] = 64;
+    buf[33] = 33;
+    try std.testing.expectError(error.InvalidHandshakeAuth, parseHandshakeAuth(&buf));
+}
+
+test "wrong message auth size" {
+    try std.testing.expectError(error.WrongAuthSize, parseMessageAuth(&[_]u8{0} ** 31));
 }
