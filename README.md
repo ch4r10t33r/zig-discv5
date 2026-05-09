@@ -15,7 +15,8 @@ The layout is modular; several areas are still stubs (`NotImplemented`) while pr
 | Message | `message` | Ordinary message RLP encode/decode (ping/pong/findnode/nodes/talk) |
 | Message crypto | `message_crypto` | AES-128-GCM for ordinary message ciphertext (spec section 2.3) |
 | ENR | `enr` | EIP-778 textual `enr:` decode (base64url + RLP layout checks) |
-| Handshake | `handshake` (alias `crypto`) | HKDF session keys, identity-proof SHA-256 (ECDH / secp256k1 not included) |
+| Handshake | `handshake` (alias `crypto`) | HKDF session keys, identity-proof SHA-256 |
+| Identity v4 | `identity_v4` | secp256k1 compressed pubkey + ECDH secret (`eph`) for HKDF input |
 | Packet | `packet` | UDP bounds, header unmask, static header + auth layouts |
 | Routing | `routing` | Kademlia table: XOR / log distance, 256 buckets, k=16, LRU/MRU, closest + FINDNODE bucket export |
 | Topic | `topic` | Topic ads / search (stub) |
