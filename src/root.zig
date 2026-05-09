@@ -14,6 +14,7 @@ pub const packet = @import("packet.zig");
 pub const message = @import("message.zig");
 pub const message_crypto = @import("message_crypto.zig");
 pub const routing = @import("routing.zig");
+pub const identity_v4 = @import("identity_v4.zig");
 pub const topic = @import("topic.zig");
 pub const node = @import("node.zig");
 
@@ -29,6 +30,7 @@ test {
     _ = message;
     _ = message_crypto;
     _ = routing;
+    _ = identity_v4;
     _ = topic;
     _ = node;
 }

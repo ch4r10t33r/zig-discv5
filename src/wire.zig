@@ -8,6 +8,7 @@ pub const packet = @import("packet.zig");
 pub const message = @import("message.zig");
 pub const message_crypto = @import("message_crypto.zig");
 pub const routing = @import("routing.zig");
+pub const identity_v4 = @import("identity_v4.zig");
 pub const handshake = @import("handshake.zig");
 pub const crypto = handshake;
 
