@@ -5,6 +5,8 @@ const errors = @import("errors.zig");
 
 pub const varint = @import("varint.zig");
 pub const packet = @import("packet.zig");
+pub const message = @import("message.zig");
+pub const message_crypto = @import("message_crypto.zig");
 
 /// First byte of decrypted `message-pt` (`message-type` in discv5-wire).
 pub const MessageKind = enum(u8) {

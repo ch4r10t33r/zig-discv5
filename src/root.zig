@@ -9,6 +9,8 @@ pub const wire = @import("wire.zig");
 pub const enr = @import("enr.zig");
 pub const crypto = @import("crypto.zig");
 pub const packet = @import("packet.zig");
+pub const message = @import("message.zig");
+pub const message_crypto = @import("message_crypto.zig");
 pub const routing = @import("routing.zig");
 pub const topic = @import("topic.zig");
 pub const node = @import("node.zig");
@@ -21,6 +23,8 @@ test {
     _ = enr;
     _ = crypto;
     _ = packet;
+    _ = message;
+    _ = message_crypto;
     _ = routing;
     _ = topic;
     _ = node;
