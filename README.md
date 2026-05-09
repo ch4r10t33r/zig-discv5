@@ -17,7 +17,7 @@ The layout is modular; several areas are still stubs (`NotImplemented`) while pr
 | ENR | `enr` | EIP-778 textual `enr:` decode (base64url + RLP layout checks) |
 | Crypto | `crypto` | Session / handshake crypto (stub) |
 | Packet | `packet` | UDP bounds, header unmask, static header + auth layouts |
-| Routing | `routing` | Kademlia table (stub) |
+| Routing | `routing` | Kademlia table: XOR / log distance, 256 buckets, k=16, LRU/MRU, closest + FINDNODE bucket export |
 | Topic | `topic` | Topic ads / search (stub) |
 | Node | `node` | Local node runtime (stub) |
 
