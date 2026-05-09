@@ -4,6 +4,7 @@
 
 pub const errors = @import("errors.zig");
 pub const varint = @import("varint.zig");
+pub const rlp = @import("rlp.zig");
 pub const wire = @import("wire.zig");
 pub const enr = @import("enr.zig");
 pub const crypto = @import("crypto.zig");
@@ -15,6 +16,7 @@ pub const node = @import("node.zig");
 test {
     _ = errors;
     _ = varint;
+    _ = rlp;
     _ = wire;
     _ = enr;
     _ = crypto;
