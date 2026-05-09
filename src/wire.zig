@@ -3,6 +3,8 @@
 const std = @import("std");
 const errors = @import("errors.zig");
 
+pub const varint = @import("varint.zig");
+
 pub fn placeholder() errors.Discv5Error!void {
     return error.NotImplemented;
 }
