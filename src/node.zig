@@ -48,7 +48,14 @@ pub const Node = struct {
     const PendingChallenge = struct {
         peer_id: NodeId,
         challenge_data: []u8,
+        /// Responder's copy of the initiator's ENR when WHOAREYOU was sent; null if none was cached.
+        cached_initiator_record: ?[]u8,
         created_ms: u64,
+    };
+
+    const TakenPending = struct {
+        challenge_data: []u8,
+        cached_initiator_record: ?[]u8,
     };
 
     const OutboundHandshake = struct {
@@ -95,7 +102,10 @@ pub const Node = struct {
     pub fn deinit(self: *Node) void {
         for (self.peer_enrs.items) |e| self.allocator.free(e.raw);
         self.peer_enrs.deinit(self.allocator);
-        for (self.pending.items) |p| self.allocator.free(p.challenge_data);
+        for (self.pending.items) |p| {
+            self.allocator.free(p.challenge_data);
+            if (p.cached_initiator_record) |r| self.allocator.free(r);
+        }
         self.pending.deinit(self.allocator);
         self.outbound.deinit(self.allocator);
         self.sessions.deinit();
@@ -133,6 +143,7 @@ pub const Node = struct {
         while (i < self.pending.items.len) {
             if (now_ms -| self.pending.items[i].created_ms > ttl) {
                 self.allocator.free(self.pending.items[i].challenge_data);
+                if (self.pending.items[i].cached_initiator_record) |r| self.allocator.free(r);
                 _ = self.pending.swapRemove(i);
             } else i += 1;
         }
@@ -149,6 +160,7 @@ pub const Node = struct {
             }
         }
         self.allocator.free(self.pending.items[min_i].challenge_data);
+        if (self.pending.items[min_i].cached_initiator_record) |r| self.allocator.free(r);
         _ = self.pending.swapRemove(min_i);
     }
 
@@ -157,18 +169,22 @@ pub const Node = struct {
         while (i < self.pending.items.len) {
             if (std.mem.eql(u8, &self.pending.items[i].peer_id, &peer_id)) {
                 self.allocator.free(self.pending.items[i].challenge_data);
+                if (self.pending.items[i].cached_initiator_record) |r| self.allocator.free(r);
                 _ = self.pending.swapRemove(i);
             } else i += 1;
         }
     }
 
-    fn takePending(self: *Node, peer_id: NodeId) ?[]u8 {
+    fn takePending(self: *Node, peer_id: NodeId) ?TakenPending {
         var i: usize = 0;
         while (i < self.pending.items.len) {
             if (std.mem.eql(u8, &self.pending.items[i].peer_id, &peer_id)) {
-                const cd = self.pending.items[i].challenge_data;
+                const p = self.pending.items[i];
                 _ = self.pending.swapRemove(i);
-                return cd;
+                return .{
+                    .challenge_data = p.challenge_data,
+                    .cached_initiator_record = p.cached_initiator_record,
+                };
             }
             i += 1;
         }
@@ -300,7 +316,11 @@ pub const Node = struct {
         const alloc = self.allocator;
         const o = self.takeOutboundByMessageNonce(parsed.header.nonce) orelse return;
 
-        _ = try parsed.decodeAuth();
+        const auth = try parsed.decodeAuth();
+        const way_enr_seq = switch (auth) {
+            .whoareyou => |w| w.enr_seq,
+            else => unreachable,
+        };
 
         var cd_buf: [packet.static_prefix_size + packet.whoareyou_auth_size]u8 = undefined;
         packet.writeWhoareyouChallengeData(&cd_buf, parsed);
@@ -316,8 +336,15 @@ pub const Node = struct {
         const sig = try identity_v4.signIdentityProof(&cd_buf, &eph_pub, o.peer_id, self.secret_key, null);
 
         const pk_self = try identity_v4.compressedPubkeyFromSecretKey(self.secret_key);
-        const record = try buildMinimalEnrRlp(alloc, self.secret_key, pk_self, self.enr_seq);
-        defer alloc.free(record);
+        const omit_record = way_enr_seq != 0 and way_enr_seq == self.enr_seq;
+        var record_owned: ?[]u8 = null;
+        defer if (record_owned) |r| alloc.free(r);
+        const record_slice: []const u8 = blk: {
+            if (omit_record) break :blk &.{};
+            const r = try buildMinimalEnrRlp(alloc, self.secret_key, pk_self, self.enr_seq);
+            record_owned = r;
+            break :blk r;
+        };
 
         var iv1: [16]u8 = undefined;
         fillRandomBytes(&iv1);
@@ -334,7 +361,7 @@ pub const Node = struct {
             33,
             &sig,
             &eph_pub,
-            record,
+            record_slice,
             &.{},
         );
         errdefer alloc.free(hs_pkt);
@@ -368,16 +395,36 @@ pub const Node = struct {
         var id_nonce: [16]u8 = undefined;
         fillRandomBytes(&id_nonce);
 
-        const challenge = try packet.allocWhoareyouChallengeData(alloc, iv, parsed.header.nonce, id_nonce, self.enr_seq);
+        var way_enr_seq: u64 = 0;
+        var cached_dup: ?[]u8 = null;
+        errdefer if (cached_dup) |s| alloc.free(s);
+        if (self.peerRecordBytes(src_id)) |raw| {
+            way_enr_seq = try enr.recordSequenceFromRaw(raw);
+            cached_dup = try alloc.dupe(u8, raw);
+        }
+
+        const challenge = try packet.allocWhoareyouChallengeData(alloc, iv, parsed.header.nonce, id_nonce, way_enr_seq);
         errdefer alloc.free(challenge);
 
-        try self.pending.append(alloc, .{ .peer_id = src_id, .challenge_data = challenge, .created_ms = now_ms });
+        self.pending.append(alloc, .{
+            .peer_id = src_id,
+            .challenge_data = challenge,
+            .cached_initiator_record = cached_dup,
+            .created_ms = now_ms,
+        }) catch |err| {
+            alloc.free(challenge);
+            if (cached_dup) |s| alloc.free(s);
+            return err;
+        };
+        cached_dup = null;
+
         errdefer {
             const last = self.pending.pop() orelse unreachable;
             alloc.free(last.challenge_data);
+            if (last.cached_initiator_record) |r| alloc.free(r);
         }
 
-        const way = try packet.encodeWhoareyouPacket(alloc, src_id, iv, parsed.header.nonce, id_nonce, self.enr_seq);
+        const way = try packet.encodeWhoareyouPacket(alloc, src_id, iv, parsed.header.nonce, id_nonce, way_enr_seq);
         errdefer alloc.free(way);
 
         try responses_out.append(alloc, way);
@@ -568,12 +615,17 @@ pub const Node = struct {
         };
         const initiator_id = hs.src_id;
 
-        const challenge_data = self.takePending(initiator_id) orelse return error.MissingHandshakePending;
-        defer alloc.free(challenge_data);
+        const pending = self.takePending(initiator_id) orelse return error.MissingHandshakePending;
+        defer alloc.free(pending.challenge_data);
+        defer if (pending.cached_initiator_record) |s| alloc.free(s);
 
-        if (hs.record.len == 0) return error.EmptyHandshakeRecord;
+        const record_bytes: []const u8 = if (hs.record.len > 0)
+            hs.record
+        else
+            (pending.cached_initiator_record orelse return error.EmptyHandshakeRecord);
+        if (record_bytes.len == 0) return error.EmptyHandshakeRecord;
 
-        const rec = try enr.decodeRecordBytes(hs.record);
+        const rec = try enr.decodeRecordBytes(record_bytes);
         try enr.verifyV4RecordPayload(alloc, rec);
         const pk = try enr.compressedSecp256k1Pubkey(rec.pairs_payload);
         const enr_id = try identity_v4.nodeIdV4FromCompressedSec1(pk);
@@ -586,10 +638,10 @@ pub const Node = struct {
 
         const ikm = try identity_v4.ecdhLocalSecret(eph, self.secret_key);
 
-        const keys = handshake.deriveSessionKeys(&ikm, challenge_data, initiator_id, self.node_id);
-        try identity_v4.verifyIdentityProof(sig, challenge_data, hs.eph_pubkey, self.node_id, pk);
+        const keys = handshake.deriveSessionKeys(&ikm, pending.challenge_data, initiator_id, self.node_id);
+        try identity_v4.verifyIdentityProof(sig, pending.challenge_data, hs.eph_pubkey, self.node_id, pk);
 
-        try self.rememberPeerRecord(initiator_id, hs.record);
+        try self.rememberPeerRecord(initiator_id, record_bytes);
 
         const ep = self.makeEndpoint(initiator_id, remote.ip, remote.port);
         try self.sessions.put(ep, session.CachedSession.fromDerived(keys), true, now_ms);
@@ -1004,6 +1056,112 @@ test "initiator opening ping completes handshake after WHOAREYOU" {
     defer msg2.deinit(alloc);
     try std.testing.expect(msg2 == .pong);
     try std.testing.expectEqualSlices(u8, &.{ 0x01, 0x02 }, msg2.pong.req_id);
+}
+
+test "initiator omits handshake record when WHOAREYOU enr-seq matches cached seq" {
+    const alloc = std.testing.allocator;
+
+    var sk_b: [32]u8 = @splat(0);
+    sk_b[31] = 201;
+    var node_b = try Node.init(alloc, .{ .secret_key = sk_b, .enr_seq = 4 });
+    defer node_b.deinit();
+
+    var sk_a: [32]u8 = @splat(0);
+    sk_a[31] = 203;
+    var node_a = try Node.init(alloc, .{ .secret_key = sk_a, .enr_seq = 2 });
+    defer node_a.deinit();
+
+    const id_a = node_a.node_id;
+    const id_b = node_b.node_id;
+    const pk_b = try identity_v4.compressedPubkeyFromSecretKey(sk_b);
+
+    const remote_a: RemoteUdp = .{ .ip = .{ .v4 = .{ 10, 0, 0, 11 } }, .port = 51111 };
+    const remote_b: RemoteUdp = .{ .ip = .{ .v4 = .{ 10, 0, 0, 22 } }, .port = 52222 };
+
+    const ordinary1 = try node_a.allocOpeningPingHandshake(id_b, pk_b, remote_b, &.{0x10}, 9);
+    defer alloc.free(ordinary1);
+
+    var from_b: std.ArrayList([]u8) = .empty;
+    defer {
+        for (from_b.items) |s| alloc.free(s);
+        from_b.deinit(alloc);
+    }
+    try node_b.handleReceive(remote_a, ordinary1, &from_b, 0);
+    try std.testing.expectEqual(@as(usize, 1), from_b.items.len);
+    const way1 = from_b.items[0];
+
+    var from_a: std.ArrayList([]u8) = .empty;
+    defer {
+        for (from_a.items) |s| alloc.free(s);
+        from_a.deinit(alloc);
+    }
+    try node_a.handleReceive(remote_b, way1, &from_a, 0);
+    try std.testing.expectEqual(@as(usize, 1), from_a.items.len);
+    const hs1 = from_a.items[0];
+
+    const hs1_copy = try alloc.dupe(u8, hs1);
+    defer alloc.free(hs1_copy);
+    const parsed_hs1 = try packet.decodeInPlace(&id_b, hs1_copy);
+    const auth1 = try parsed_hs1.decodeAuth();
+    const h1 = switch (auth1) {
+        .handshake => |h| h,
+        else => unreachable,
+    };
+    try std.testing.expect(h1.record.len > 0);
+
+    for (from_b.items) |s| alloc.free(s);
+    from_b.clearRetainingCapacity();
+
+    try node_b.handleReceive(remote_a, hs1, &from_b, 0);
+
+    const ep_on_a = node_a.makeEndpoint(id_b, remote_b.ip, remote_b.port);
+    const ep_on_b = node_b.makeEndpoint(id_a, remote_a.ip, remote_a.port);
+    _ = node_a.sessions.remove(ep_on_a);
+    _ = node_b.sessions.remove(ep_on_b);
+
+    const ordinary2 = try node_a.allocOpeningPingHandshake(id_b, pk_b, remote_b, &.{0x20}, 1);
+    defer alloc.free(ordinary2);
+
+    for (from_b.items) |s| alloc.free(s);
+    from_b.clearRetainingCapacity();
+    try node_b.handleReceive(remote_a, ordinary2, &from_b, 0);
+    try std.testing.expectEqual(@as(usize, 1), from_b.items.len);
+    const way2 = from_b.items[0];
+
+    const way2_copy = try alloc.dupe(u8, way2);
+    defer alloc.free(way2_copy);
+    const parsed_way2 = try packet.decodeInPlace(&id_a, way2_copy);
+    const way_auth = try parsed_way2.decodeAuth();
+    const way_body = switch (way_auth) {
+        .whoareyou => |w| w,
+        else => unreachable,
+    };
+    try std.testing.expectEqual(@as(u64, 2), way_body.enr_seq);
+
+    for (from_a.items) |s| alloc.free(s);
+    from_a.clearRetainingCapacity();
+    try node_a.handleReceive(remote_b, way2, &from_a, 0);
+    try std.testing.expectEqual(@as(usize, 1), from_a.items.len);
+    const hs2 = from_a.items[0];
+
+    const hs2_copy = try alloc.dupe(u8, hs2);
+    defer alloc.free(hs2_copy);
+    const parsed_hs2 = try packet.decodeInPlace(&id_b, hs2_copy);
+    const auth2 = try parsed_hs2.decodeAuth();
+    const h2 = switch (auth2) {
+        .handshake => |h| h,
+        else => unreachable,
+    };
+    try std.testing.expectEqual(@as(usize, 0), h2.record.len);
+
+    for (from_b.items) |s| alloc.free(s);
+    from_b.clearRetainingCapacity();
+
+    try node_b.handleReceive(remote_a, hs2, &from_b, 0);
+    try std.testing.expectEqual(@as(usize, 0), from_b.items.len);
+
+    try std.testing.expect(node_a.sessions.get(ep_on_a, 0) != null);
+    try std.testing.expect(node_b.sessions.get(ep_on_b, 0) != null);
 }
 
 test "session findnode returns encrypted nodes for cached peer enrs" {

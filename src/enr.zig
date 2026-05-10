@@ -62,6 +62,11 @@ pub fn decodeRecordBytes(raw: []const u8) Error!RecordPayload {
     };
 }
 
+/// ENR sequence field from raw RLP bytes (WHOAREYOU `enr-seq` when the responder has a cached record).
+pub fn recordSequenceFromRaw(raw: []const u8) Error!u64 {
+    return (try decodeRecordBytes(raw)).seq;
+}
+
 fn decodeSeqBeU64(s: []const u8) error{BadSequenceEncoding}!u64 {
     if (s.len > 8) return error.BadSequenceEncoding;
     if (s.len == 0) return 0;
@@ -332,6 +337,7 @@ test "v4 sign and verify roundtrip" {
     defer alloc.free(raw);
 
     try verifyV4RecordSignature(alloc, raw);
+    try std.testing.expectEqual(@as(u64, 3), try recordSequenceFromRaw(raw));
 }
 
 test "verify devp2p enr.md example record" {
