@@ -12,6 +12,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const enr = @import("enr.zig");
+const ingress_limit = @import("ingress_limit.zig");
 const handshake = @import("handshake.zig");
 const identity_v4 = @import("identity_v4.zig");
 const message = @import("message.zig");
@@ -27,6 +28,20 @@ pub const RemoteUdp = struct {
     port: u16,
 };
 
+/// Opaque key for **ingress_limit** (IPv4 address big-endian in high bits, port in low 16 bits; IPv6 uses Wyhash).
+pub fn ingressRateKey(remote: RemoteUdp) u64 {
+    switch (remote.ip) {
+        .v4 => |b| {
+            const ipu = std.mem.readInt(u32, &b, .big);
+            return (@as(u64, ipu) << 16) | @as(u64, remote.port);
+        },
+        .v6 => |b| {
+            const h = std.hash.Wyhash.hash(0, &b);
+            return h ^ (@as(u64, remote.port) << 48);
+        },
+    }
+}
+
 pub const Config = struct {
     secret_key: [32]u8,
     enr_seq: u64 = 0,
@@ -37,6 +52,10 @@ pub const Config = struct {
     pending_challenge_ttl_ms: ?u64 = null,
     /// Upper bound on pending WHOAREYOU entries; oldest is evicted when full.
     pending_challenge_cap: usize = 256,
+    /// Inbound datagram rate limits (applied before decode). Defaults disable limits.
+    ingress: ingress_limit.Config = .{},
+    /// Drop **allocOpeningPingHandshake** state when no WHOAREYOU arrives within this time. Null disables.
+    outbound_opening_ttl_ms: ?u64 = null,
 };
 
 /// Max number of logarithmic distances in one FINDNODE (discv5 clients typically use small lists).
@@ -71,6 +90,7 @@ pub const Node = struct {
         peer_pubkey_compressed: [33]u8,
         remote: RemoteUdp,
         message_nonce: [12]u8,
+        created_ms: u64,
     };
 
     const OutboundPing = struct {
@@ -84,6 +104,8 @@ pub const Node = struct {
     enr_seq: u64,
     pending_challenge_ttl_ms: ?u64,
     pending_challenge_cap: usize,
+    outbound_opening_ttl_ms: ?u64,
+    ingress: ingress_limit.IngressLimiter,
     sessions: session.SessionTable,
     routing: routing.RoutingTable,
     /// Raw ENR RLP bytes keyed by node id (e.g. from verified inbound handshakes). Used for NODES replies.
@@ -105,6 +127,8 @@ pub const Node = struct {
             .enr_seq = cfg.enr_seq,
             .pending_challenge_ttl_ms = cfg.pending_challenge_ttl_ms,
             .pending_challenge_cap = @max(1, cfg.pending_challenge_cap),
+            .outbound_opening_ttl_ms = cfg.outbound_opening_ttl_ms,
+            .ingress = ingress_limit.IngressLimiter.init(cfg.ingress),
             .sessions = sessions,
             .routing = routing.RoutingTable.init(nid),
             .peer_enrs = .empty,
@@ -125,6 +149,7 @@ pub const Node = struct {
         for (self.outbound_pings.items) |e| self.allocator.free(e.req_id);
         self.outbound_pings.deinit(self.allocator);
         self.outbound.deinit(self.allocator);
+        self.ingress.deinit(self.allocator);
         self.sessions.deinit();
     }
 
@@ -180,6 +205,16 @@ pub const Node = struct {
 
     pub fn makeEndpoint(_: *const Node, peer_id: NodeId, ip: session.IpAddr, port: u16) session.UdpEndpoint {
         return .{ .node_id = peer_id, .ip = ip, .port = port };
+    }
+
+    fn pruneStaleOutbounds(self: *Node, now_ms: u64) void {
+        const ttl = self.outbound_opening_ttl_ms orelse return;
+        var i: usize = 0;
+        while (i < self.outbound.items.len) {
+            if (now_ms -| self.outbound.items[i].created_ms > ttl) {
+                _ = self.outbound.swapRemove(i);
+            } else i += 1;
+        }
     }
 
     fn pruneExpiredPending(self: *Node, now_ms: u64) void {
@@ -254,6 +289,7 @@ pub const Node = struct {
         std.mem.Allocator.Error ||
         std.crypto.errors.IdentityElementError ||
         std.crypto.errors.NonCanonicalError ||
+        ingress_limit.RateLimited ||
         error{ MissingHandshakePending, EmptyHandshakeRecord, EnrNodeIdMismatch, BadHandshakeSignatureLength, FindnodeResponseTooLarge };
 
     fn clearOutboundForPeer(self: *Node, peer_id: NodeId) void {
@@ -285,6 +321,7 @@ pub const Node = struct {
         remote: RemoteUdp,
         req_id: []const u8,
         ping_enr_seq: u64,
+        now_ms: u64,
     ) OpeningHandshakeError![]u8 {
         const alloc = self.allocator;
         const derived = try identity_v4.nodeIdV4FromCompressedSec1(peer_pubkey_compressed);
@@ -322,6 +359,7 @@ pub const Node = struct {
             .peer_pubkey_compressed = peer_pubkey_compressed,
             .remote = remote,
             .message_nonce = nonce,
+            .created_ms = now_ms,
         });
         return pkt;
     }
@@ -338,6 +376,12 @@ pub const Node = struct {
         const alloc = self.allocator;
 
         self.pruneExpiredPending(now_ms);
+        self.pruneStaleOutbounds(now_ms);
+
+        self.ingress.recordInbound(alloc, ingressRateKey(remote), now_ms) catch |err| switch (err) {
+            error.RateLimited => return error.RateLimited,
+            else => |e| return e,
+        };
 
         const copy = try alloc.dupe(u8, datagram);
         defer alloc.free(copy);
@@ -774,6 +818,64 @@ fn buildMinimalEnrRlp(allocator: std.mem.Allocator, secret_key: [32]u8, compress
     return try enr_mod.encodeV4RecordSigned(allocator, secret_key, seq, pairs.items);
 }
 
+test "handleReceive ingress per-peer cap" {
+    const alloc = std.testing.allocator;
+
+    var sk: [32]u8 = @splat(0);
+    sk[31] = 3;
+    var node_b = try Node.init(alloc, .{
+        .secret_key = sk,
+        .ingress = .{
+            .per_peer_max_packets = 2,
+            .per_peer_window_ms = 60_000,
+            .global_max_packets = null,
+        },
+    });
+    defer node_b.deinit();
+
+    const remote: RemoteUdp = .{ .ip = .{ .v4 = .{ 203, 0, 113, 7 } }, .port = 7777 };
+    var junk: [packet.min_packet_size]u8 = @splat(0xaa);
+
+    var responses: std.ArrayList([]u8) = .empty;
+    defer {
+        for (responses.items) |s| alloc.free(s);
+        responses.deinit(alloc);
+    }
+
+    try std.testing.expectError(error.InvalidProtocol, node_b.handleReceive(remote, &junk, &responses, 0));
+    try std.testing.expectError(error.InvalidProtocol, node_b.handleReceive(remote, &junk, &responses, 1));
+    try std.testing.expectError(error.RateLimited, node_b.handleReceive(remote, &junk, &responses, 2));
+}
+
+test "outbound opening handshake state expires" {
+    const alloc = std.testing.allocator;
+
+    var sk_a: [32]u8 = @splat(0);
+    sk_a[31] = 41;
+    var node_a = try Node.init(alloc, .{ .secret_key = sk_a, .outbound_opening_ttl_ms = 50 });
+    defer node_a.deinit();
+
+    var sk_b: [32]u8 = @splat(0);
+    sk_b[31] = 43;
+    const id_b = try identity_v4.nodeIdV4FromSecretKey(sk_b);
+    const pk_b = try identity_v4.compressedPubkeyFromSecretKey(sk_b);
+    const remote_b: RemoteUdp = .{ .ip = .{ .v4 = .{ 10, 0, 0, 2 } }, .port = 40000 };
+
+    const pkt = try node_a.allocOpeningPingHandshake(id_b, pk_b, remote_b, &.{0xab}, 1, 0);
+    defer alloc.free(pkt);
+    try std.testing.expectEqual(@as(usize, 1), node_a.outbound.items.len);
+
+    var junk: [packet.min_packet_size]u8 = @splat(0xbb);
+    var responses: std.ArrayList([]u8) = .empty;
+    defer {
+        for (responses.items) |s| alloc.free(s);
+        responses.deinit(alloc);
+    }
+    const r: RemoteUdp = .{ .ip = .{ .v4 = .{ 9, 9, 9, 9 } }, .port = 1 };
+    try std.testing.expectError(error.InvalidProtocol, node_a.handleReceive(r, &junk, &responses, 100));
+    try std.testing.expectEqual(@as(usize, 0), node_a.outbound.items.len);
+}
+
 test "unknown session ordinary yields WHOAREYOU with echoed nonce" {
     const alloc = std.testing.allocator;
 
@@ -1093,7 +1195,7 @@ test "initiator opening ping completes handshake after WHOAREYOU" {
     const remote_a: RemoteUdp = .{ .ip = .{ .v4 = .{ 10, 0, 0, 11 } }, .port = 51111 };
     const remote_b: RemoteUdp = .{ .ip = .{ .v4 = .{ 10, 0, 0, 22 } }, .port = 52222 };
 
-    const ordinary = try node_a.allocOpeningPingHandshake(id_b, pk_b, remote_b, &.{ 0xca, 0xfe }, 9);
+    const ordinary = try node_a.allocOpeningPingHandshake(id_b, pk_b, remote_b, &.{ 0xca, 0xfe }, 9, 0);
     defer alloc.free(ordinary);
 
     var from_b: std.ArrayList([]u8) = .empty;
@@ -1189,7 +1291,7 @@ test "initiator omits handshake record when WHOAREYOU enr-seq matches cached seq
     const remote_a: RemoteUdp = .{ .ip = .{ .v4 = .{ 10, 0, 0, 11 } }, .port = 51111 };
     const remote_b: RemoteUdp = .{ .ip = .{ .v4 = .{ 10, 0, 0, 22 } }, .port = 52222 };
 
-    const ordinary1 = try node_a.allocOpeningPingHandshake(id_b, pk_b, remote_b, &.{0x10}, 9);
+    const ordinary1 = try node_a.allocOpeningPingHandshake(id_b, pk_b, remote_b, &.{0x10}, 9, 0);
     defer alloc.free(ordinary1);
 
     var from_b: std.ArrayList([]u8) = .empty;
@@ -1230,7 +1332,7 @@ test "initiator omits handshake record when WHOAREYOU enr-seq matches cached seq
     _ = node_a.sessions.remove(ep_on_a);
     _ = node_b.sessions.remove(ep_on_b);
 
-    const ordinary2 = try node_a.allocOpeningPingHandshake(id_b, pk_b, remote_b, &.{0x20}, 1);
+    const ordinary2 = try node_a.allocOpeningPingHandshake(id_b, pk_b, remote_b, &.{0x20}, 1, 0);
     defer alloc.free(ordinary2);
 
     for (from_b.items) |s| alloc.free(s);
