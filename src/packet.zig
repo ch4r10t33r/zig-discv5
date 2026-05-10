@@ -216,6 +216,17 @@ pub fn allocWhoareyouChallengeData(
     return out;
 }
 
+/// Writes the WHOAREYOU challenge bytes used as HKDF salt in **handshake.deriveSessionKeys** (unmasked prefix).
+pub fn writeWhoareyouChallengeData(out: *[static_prefix_size + whoareyou_auth_size]u8, parsed: ParsedPacket) void {
+    std.debug.assert(parsed.header.flag == .whoareyou);
+    std.debug.assert(parsed.auth_data.len == whoareyou_auth_size);
+    @memcpy(out[0..16], &parsed.iv);
+    var static_plain: [static_header_size]u8 = undefined;
+    writePlaintextStaticHeader(&static_plain, .whoareyou, parsed.header.nonce, whoareyou_auth_size);
+    @memcpy(out[16..][0..static_header_size], &static_plain);
+    @memcpy(out[static_prefix_size..], parsed.auth_data);
+}
+
 pub fn encodeWhoareyouPacket(
     allocator: std.mem.Allocator,
     dest_node_id: [32]u8,
