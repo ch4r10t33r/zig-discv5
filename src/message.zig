@@ -1,6 +1,7 @@
 //! RLP protocol messages (`message-type` byte + `message-data` list) per [discv5-wire](https://github.com/ethereum/devp2p/blob/master/discv5/discv5-wire.md).
 
 const std = @import("std");
+const build_options = @import("build_options");
 const rlp = @import("rlp.zig");
 
 pub const type_ping: u8 = 0x01;
@@ -157,10 +158,22 @@ pub fn decodePlaintext(plaintext: []const u8, allocator: std.mem.Allocator) (Dec
         type_nodes => .{ .nodes = try decodeNodes(allocator, body) },
         type_talkreq => .{ .talkreq = try decodeTalkRequest(body) },
         type_talkresp => .{ .talkresp = try decodeTalkResponse(body) },
-        type_regtopic => .{ .regtopic = try decodeRegtopic(body) },
-        type_ticket => .{ .ticket = try decodeTicketResponse(body) },
-        type_regconfirmation => .{ .regconfirmation = try decodeRegconfirmation(body) },
-        type_topicquery => .{ .topicquery = try decodeTopicquery(body) },
+        type_regtopic => if (build_options.experimental_topic_wire)
+            .{ .regtopic = try decodeRegtopic(body) }
+        else
+            return error.UnknownKind,
+        type_ticket => if (build_options.experimental_topic_wire)
+            .{ .ticket = try decodeTicketResponse(body) }
+        else
+            return error.UnknownKind,
+        type_regconfirmation => if (build_options.experimental_topic_wire)
+            .{ .regconfirmation = try decodeRegconfirmation(body) }
+        else
+            return error.UnknownKind,
+        type_topicquery => if (build_options.experimental_topic_wire)
+            .{ .topicquery = try decodeTopicquery(body) }
+        else
+            return error.UnknownKind,
         else => error.UnknownKind,
     };
 }
@@ -668,6 +681,8 @@ test "nodes talk roundtrip" {
 }
 
 test "topic wire roundtrip" {
+    if (!build_options.experimental_topic_wire) return error.SkipZigTest;
+
     const alloc = std.testing.allocator;
 
     const th = [_]u8{0xbb} ** 32;
@@ -696,4 +711,14 @@ test "topic wire roundtrip" {
     const dec_q = try decodePlaintext(enc_q, alloc);
     defer dec_q.deinit(alloc);
     try std.testing.expect(dec_q == .topicquery);
+}
+
+test "topic wire decode disabled rejects experimental kinds" {
+    if (build_options.experimental_topic_wire) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    const th = [_]u8{0xbb} ** 32;
+    const enc_r = try encodeRegtopicPlaintext(alloc, &.{0x01}, &th, "enr-bytes", "");
+    defer alloc.free(enc_r);
+    try std.testing.expectError(error.UnknownKind, decodePlaintext(enc_r, alloc));
 }

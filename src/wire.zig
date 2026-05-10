@@ -1,6 +1,7 @@
 //! Wire encoding and message framing ([discv5-wire](https://github.com/ethereum/devp2p/blob/master/discv5/discv5-wire.md)).
 
 const std = @import("std");
+const build_options = @import("build_options");
 const errors = @import("errors.zig");
 
 pub const varint = @import("varint.zig");
@@ -35,10 +36,10 @@ pub const MessageKind = enum(u8) {
             0x04 => .nodes,
             0x05 => .talkreq,
             0x06 => .talkresp,
-            0x07 => .regtopic,
-            0x08 => .ticket,
-            0x09 => .regconfirmation,
-            0x0a => .topicquery,
+            0x07 => if (build_options.experimental_topic_wire) .regtopic else null,
+            0x08 => if (build_options.experimental_topic_wire) .ticket else null,
+            0x09 => if (build_options.experimental_topic_wire) .regconfirmation else null,
+            0x0a => if (build_options.experimental_topic_wire) .topicquery else null,
             else => null,
         };
     }
@@ -54,6 +55,10 @@ test "wire stub" {
 
 test "message kind parse" {
     try std.testing.expect(MessageKind.parse(0x01).? == .ping);
-    try std.testing.expect(MessageKind.parse(0x0a).? == .topicquery);
+    if (build_options.experimental_topic_wire) {
+        try std.testing.expect(MessageKind.parse(0x0a).? == .topicquery);
+    } else {
+        try std.testing.expect(MessageKind.parse(0x0a) == null);
+    }
     try std.testing.expect(MessageKind.parse(0xff) == null);
 }

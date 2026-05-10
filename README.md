@@ -12,7 +12,7 @@ The layout is modular; several areas are still stubs (`NotImplemented`) while pr
 | Varint | `varint` | Unsigned LEB128 (`u64`), minimal encoding, strict decode |
 | RLP | `rlp` | Strings and lists for devp2p payloads |
 | Wire | `wire` | `MessageKind`, `varint`, `packet`, `message`, `message_crypto` |
-| Message | `message` | Ordinary message RLP encode/decode (ping/pong/findnode/nodes/talk; REGTOPIC/TICKET/REGCONFIRMATION/TOPICQUERY are experimental per wire spec) |
+| Message | `message` | Ordinary message RLP encode/decode; REGTOPIC/TICKET/REGCONFIRMATION/TOPICQUERY (0x07–0x0a) decode only when `-Dexperimental_topic_wire=true` (default). Encode helpers always exist for tooling. |
 | Message crypto | `message_crypto` | AES-128-GCM for ordinary message ciphertext (spec section 2.3) |
 | ENR | `enr` | EIP-778 textual `enr:` decode (base64url + RLP layout checks) |
 | Handshake | `handshake` (alias `crypto`) | HKDF session keys, identity-proof SHA-256 |
@@ -38,6 +38,12 @@ zig build test
 zig fmt --check .
 ```
 
+Build option (non-final [topic advertisement](https://github.com/ethereum/devp2p/blob/master/discv5/discv5.md) wire):
+
+```sh
+zig build test -Dexperimental_topic_wire=false
+```
+
 ## Use as a dependency
 
 Add `zig_discv5` as a path or URL dependency in your `build.zig.zon`, then import the module in `build.zig`:
@@ -53,7 +59,16 @@ Exact `dependency` shape depends on whether you consume the package from a git U
 
 ## Continuous integration
 
-GitHub Actions runs `zig fmt --check .` and `zig build test` on pushes and pull requests.
+- [`.github/workflows/ci.yml`](.github/workflows/ci.yml) — on pushes and PRs to `main`: format check, `zig build test`, and the same tests with `-Dexperimental_topic_wire=false`.
+
+## Releases
+
+Manual release (creates a GitHub Release and tag at the current commit):
+
+1. Ensure `version` in `build.zig.zon` matches the tag without the `v` prefix (e.g. tag `v0.1.0` ↔ version `0.1.0`).
+2. Actions → **Release** → **Run workflow** → set tag (default `v0.1.0`).
+
+Workflow: [`.github/workflows/release.yml`](.github/workflows/release.yml).
 
 ## Specification
 

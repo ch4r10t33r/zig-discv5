@@ -4,25 +4,23 @@ on:
   push:
     branches: [main]
   pull_request:
-  workflow_dispatch:
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
-  cancel-in-progress: true
+    branches: [main]
 
 jobs:
-  lint-and-test:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Zig
-        uses: mlugg/setup-zig@v2.0.5
+      - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
 
-      - name: Format check
+      - name: Format
         run: zig fmt --check .
 
-      - name: Test
-        run: zig build test
+      - name: Test (default options)
+        run: zig build test --summary all
+
+      - name: Test (experimental topic wire off)
+        run: zig build test --summary all -Dexperimental_topic_wire=false
