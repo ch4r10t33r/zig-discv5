@@ -191,6 +191,8 @@ pub const Node = struct {
         packet.EncodeError ||
         routing.Error ||
         std.mem.Allocator.Error ||
+        std.crypto.errors.IdentityElementError ||
+        std.crypto.errors.NonCanonicalError ||
         error{ MissingHandshakePending, EmptyHandshakeRecord, EnrNodeIdMismatch, BadHandshakeSignatureLength, FindnodeResponseTooLarge };
 
     fn clearOutboundForPeer(self: *Node, peer_id: NodeId) void {
@@ -314,7 +316,7 @@ pub const Node = struct {
         const sig = try identity_v4.signIdentityProof(&cd_buf, &eph_pub, o.peer_id, self.secret_key, null);
 
         const pk_self = try identity_v4.compressedPubkeyFromSecretKey(self.secret_key);
-        const record = try buildMinimalEnrRlp(alloc, pk_self, self.enr_seq);
+        const record = try buildMinimalEnrRlp(alloc, self.secret_key, pk_self, self.enr_seq);
         defer alloc.free(record);
 
         var iv1: [16]u8 = undefined;
@@ -572,6 +574,7 @@ pub const Node = struct {
         if (hs.record.len == 0) return error.EmptyHandshakeRecord;
 
         const rec = try enr.decodeRecordBytes(hs.record);
+        try enr.verifyV4RecordPayload(alloc, rec);
         const pk = try enr.compressedSecp256k1Pubkey(rec.pairs_payload);
         const enr_id = try identity_v4.nodeIdV4FromCompressedSec1(pk);
         if (!std.mem.eql(u8, &enr_id, &initiator_id)) return error.EnrNodeIdMismatch;
@@ -657,27 +660,16 @@ fn weakRandomFill(buf: []u8) void {
     @memset(&seed, 0);
 }
 
-fn buildMinimalEnrRlp(allocator: std.mem.Allocator, compressed_pk: [33]u8, seq: u64) ![]u8 {
+fn buildMinimalEnrRlp(allocator: std.mem.Allocator, secret_key: [32]u8, compressed_pk: [33]u8, seq: u64) ![]u8 {
     const rlp_mod = @import("rlp.zig");
-    var inner: std.ArrayList(u8) = .empty;
-    defer inner.deinit(allocator);
-    var sig65: [65]u8 = undefined;
-    @memset(&sig65, 0);
-    try rlp_mod.appendString(&inner, allocator, &sig65);
-    var seq_buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &seq_buf, seq, .big);
-    var seq_start: usize = 0;
-    while (seq_start < seq_buf.len and seq_buf[seq_start] == 0) seq_start += 1;
-    const seq_slice: []const u8 = if (seq == 0) &[_]u8{} else seq_buf[seq_start..];
-    try rlp_mod.appendString(&inner, allocator, seq_slice);
-    try rlp_mod.appendString(&inner, allocator, "id");
-    try rlp_mod.appendString(&inner, allocator, "v4");
-    try rlp_mod.appendString(&inner, allocator, "secp256k1");
-    try rlp_mod.appendString(&inner, allocator, &compressed_pk);
-    var raw: std.ArrayList(u8) = .empty;
-    defer raw.deinit(allocator);
-    try rlp_mod.appendListPayload(&raw, allocator, inner.items);
-    return try raw.toOwnedSlice(allocator);
+    const enr_mod = @import("enr.zig");
+    var pairs: std.ArrayList(u8) = .empty;
+    defer pairs.deinit(allocator);
+    try rlp_mod.appendString(&pairs, allocator, "id");
+    try rlp_mod.appendString(&pairs, allocator, "v4");
+    try rlp_mod.appendString(&pairs, allocator, "secp256k1");
+    try rlp_mod.appendString(&pairs, allocator, &compressed_pk);
+    return try enr_mod.encodeV4RecordSigned(allocator, secret_key, seq, pairs.items);
 }
 
 test "unknown session ordinary yields WHOAREYOU with echoed nonce" {
@@ -855,7 +847,7 @@ test "responder completes handshake and answers ping inside handshake" {
 
     const keys_a = handshake.deriveSessionKeys(&ikm_a, &cd_buf, id_a, node_b.node_id);
 
-    const record = try buildMinimalEnrRlp(alloc, pk_a, 1);
+    const record = try buildMinimalEnrRlp(alloc, sk_a, pk_a, 1);
     defer alloc.free(record);
 
     const sig = try identity_v4.signIdentityProof(&cd_buf, &eph_pub, node_b.node_id, sk_a, null);
