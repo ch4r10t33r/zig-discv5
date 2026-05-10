@@ -1,6 +1,7 @@
-//! Sliding-window counters for inbound datagrams (per peer key and global).
-//! Peer keys are opaque **u64**s (e.g. IPv4 host+port); see **Node** for encoding.
-//! Applied before crypto decode so cheap bogus traffic still consumes quota.
+//! Sliding-window packet counters (per peer key and global).
+//! Peer keys are opaque **u64**s (e.g. IPv4 host+port); see **Node.ingressRateKey**.
+//! For **inbound**, call **recordInbound** before allocate/decode so bogus traffic still consumes quota.
+//! The same **IngressLimiter** type can bound **outbound** sends (e.g. **udp_runtime.pumpOnceEx**).
 
 const std = @import("std");
 

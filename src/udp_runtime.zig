@@ -6,6 +6,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const node_mod = @import("node.zig");
+const ingress_limit = @import("ingress_limit.zig");
 const identity_v4 = @import("identity_v4.zig");
 const message = @import("message.zig");
 const message_crypto = @import("message_crypto.zig");
@@ -118,7 +119,15 @@ pub fn sendDatagram(sock: UdpSocket, remote: RemoteUdp, payload: []const u8) Sen
     }
 }
 
-pub const PumpError = RecvError || SendError || Node.ReceiveError || std.mem.Allocator.Error;
+pub const PumpError = RecvError || SendError || Node.ReceiveError || ingress_limit.RateLimited || std.mem.Allocator.Error;
+
+pub const PumpResult = enum { idle, progressed };
+
+/// Optional limits for **pumpOnceEx** (send-side uses the same sliding-window type as inbound).
+pub const PumpOpts = struct {
+    /// If non-null, each outbound datagram to the source address counts before **sendDatagram**; excess returns **error.RateLimited** (unsent replies are freed in defer).
+    egress_limiter: ?*ingress_limit.IngressLimiter = null,
+};
 
 /// Receives at most one datagram, runs `Node.handleReceive`, and sends each reply to the source address.
 /// `responses` must be empty on entry; allocated replies are freed before returning.
@@ -131,7 +140,21 @@ pub fn pumpOnce(
     responses: *std.ArrayList([]u8),
     recv_flags: u32,
     now_ms: u64,
-) PumpError!enum { idle, progressed } {
+) PumpError!PumpResult {
+    return pumpOnceEx(allocator, sock, node_ptr, recv_buf, responses, recv_flags, now_ms, .{});
+}
+
+/// Like **pumpOnce** with optional **egress_limiter** for per-pump send caps.
+pub fn pumpOnceEx(
+    allocator: std.mem.Allocator,
+    sock: UdpSocket,
+    node_ptr: *Node,
+    recv_buf: []u8,
+    responses: *std.ArrayList([]u8),
+    recv_flags: u32,
+    now_ms: u64,
+    opts: PumpOpts,
+) PumpError!PumpResult {
     std.debug.assert(responses.items.len == 0);
 
     const got = try recvDatagram(sock, recv_buf, recv_flags) orelse return .idle;
@@ -143,7 +166,11 @@ pub fn pumpOnce(
         responses.clearRetainingCapacity();
     }
 
+    const peer_key = node_mod.ingressRateKey(got.remote);
     for (responses.items) |pkt| {
+        if (opts.egress_limiter) |lim| {
+            try lim.recordInbound(allocator, peer_key, now_ms);
+        }
         try sendDatagram(sock, got.remote, pkt);
     }
     return .progressed;
@@ -231,4 +258,83 @@ test "UDP pump sends WHOAREYOU to peer socket" {
     const parsed = try packet.decodeInPlace(&id_a, dec_copy);
     try std.testing.expect(parsed.header.flag == .whoareyou);
     try std.testing.expectEqualSlices(u8, &nonce, &parsed.header.nonce);
+}
+
+test "pumpOnceEx egress limiter blocks second reply burst to same peer" {
+    const alloc = std.testing.allocator;
+
+    var egress = ingress_limit.IngressLimiter.init(.{
+        .per_peer_max_packets = 1,
+        .per_peer_window_ms = 60_000,
+        .global_max_packets = null,
+    });
+    defer egress.deinit(alloc);
+
+    var server = try UdpSocket.initIpv4Udp();
+    defer server.close();
+    try server.bindIpv4Any(0);
+    const server_port = try server.localPort();
+
+    var client = try UdpSocket.initIpv4Udp();
+    defer client.close();
+    try client.bindIpv4Any(0);
+
+    var sk_b: [32]u8 = @splat(0);
+    sk_b[31] = 3;
+    var node_b = try Node.init(alloc, .{ .secret_key = sk_b, .enr_seq = 9 });
+    defer node_b.deinit();
+
+    var sk_a: [32]u8 = @splat(0);
+    sk_a[31] = 5;
+    const id_a = try identity_v4.nodeIdV4FromSecretKey(sk_a);
+
+    var iv: [16]u8 = undefined;
+    @memset(&iv, 0x2a);
+    var nonce: [12]u8 = undefined;
+    for (&nonce, 0..) |*b, i| b.* = @truncate(i + 1);
+
+    const ping_pt = try message.encodePingPlaintext(alloc, &.{0x07}, 4);
+    defer alloc.free(ping_pt);
+
+    const key = [_]u8{0x55} ** 16;
+    var prefix: [packet.static_prefix_size + packet.message_auth_size]u8 = undefined;
+    @memcpy(prefix[0..16], &iv);
+    var static_plain: [packet.static_header_size]u8 = undefined;
+    packet.writePlaintextStaticHeader(&static_plain, .message, nonce, packet.message_auth_size);
+    @memcpy(prefix[16..][0..packet.static_header_size], &static_plain);
+    @memcpy(prefix[packet.static_prefix_size..][0..packet.message_auth_size], &id_a);
+
+    const ct = try message_crypto.encryptMessage(alloc, key, nonce, ping_pt, &prefix);
+    defer alloc.free(ct);
+
+    const ordinary = try packet.encodeOrdinaryMessagePacket(alloc, node_b.node_id, iv, nonce, id_a, ct);
+    defer alloc.free(ordinary);
+
+    const dst: RemoteUdp = .{ .ip = .{ .v4 = .{ 127, 0, 0, 1 } }, .port = server_port };
+    try sendDatagram(client, dst, ordinary);
+
+    var recv_buf: [packet.max_packet_size]u8 = undefined;
+    var responses: std.ArrayList([]u8) = .empty;
+    defer responses.deinit(alloc);
+
+    const st1 = try pumpOnceEx(alloc, server, &node_b, &recv_buf, &responses, 0, 0, .{ .egress_limiter = &egress });
+    try std.testing.expectEqual(@as(@TypeOf(st1), .progressed), st1);
+
+    var reply_buf: [packet.max_packet_size]u8 = undefined;
+    _ = (try recvDatagram(client, &reply_buf, 0)) orelse unreachable;
+
+    var nonce2: [12]u8 = undefined;
+    for (&nonce2, 0..) |*b, i| b.* = @truncate(i + 3);
+    const ping_pt2 = try message.encodePingPlaintext(alloc, &.{0x08}, 4);
+    defer alloc.free(ping_pt2);
+    packet.writePlaintextStaticHeader(&static_plain, .message, nonce2, packet.message_auth_size);
+    @memcpy(prefix[16..][0..packet.static_header_size], &static_plain);
+    @memcpy(prefix[packet.static_prefix_size..][0..packet.message_auth_size], &id_a);
+    const ct2 = try message_crypto.encryptMessage(alloc, key, nonce2, ping_pt2, &prefix);
+    defer alloc.free(ct2);
+    const ordinary2 = try packet.encodeOrdinaryMessagePacket(alloc, node_b.node_id, iv, nonce2, id_a, ct2);
+    defer alloc.free(ordinary2);
+    try sendDatagram(client, dst, ordinary2);
+
+    try std.testing.expectError(error.RateLimited, pumpOnceEx(alloc, server, &node_b, &recv_buf, &responses, 0, 0, .{ .egress_limiter = &egress }));
 }

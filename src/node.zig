@@ -8,6 +8,9 @@
 //! marks the peer verified; for strict PING tracking call **registerOutboundPing** before sending an encrypted
 //! PING, then an inbound **PONG** with the same **req_id** sets **ping_replied**. Use **RoutingTable.pickStaleBucketForRefresh**
 //! / **markBucketRefreshed** for periodic bucket refresh.
+//!
+//! Operational limits: **Config.ingress** and **udp_runtime.pumpOnceEx** with **PumpOpts.egress_limiter** (same
+//! **ingress_limit.IngressLimiter** type for send-side windows).
 
 const std = @import("std");
 const builtin = @import("builtin");
