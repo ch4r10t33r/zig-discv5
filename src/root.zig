@@ -18,6 +18,7 @@ pub const identity_v4 = @import("identity_v4.zig");
 pub const session = @import("session.zig");
 pub const topic = @import("topic.zig");
 pub const node = @import("node.zig");
+pub const udp_runtime = @import("udp_runtime.zig");
 
 test {
     _ = errors;
@@ -35,4 +36,5 @@ test {
     _ = session;
     _ = topic;
     _ = node;
+    _ = udp_runtime;
 }
