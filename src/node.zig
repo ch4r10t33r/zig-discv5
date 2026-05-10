@@ -1,4 +1,5 @@
-//! Discovery v5 node: inbound `handleReceive`, outbound handshake opening, session cache, and encrypted PING/PONG.
+//! Discovery v5 node: inbound `handleReceive`, outbound handshake opening, session cache, and encrypted
+//! PING/PONG, FINDNODE/NODES (cached peer ENRs, chunked replies), and TALKREQ/TALKRESP (default echo).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -24,6 +25,16 @@ pub const Config = struct {
     session_table_cap: usize = 256,
 };
 
+/// Max number of logarithmic distances in one FINDNODE (discv5 clients typically use small lists).
+const max_findnode_distances: usize = 32;
+/// Max ENR payloads per NODES packet (conservative; keeps UDP datagrams under typical MTU).
+const max_enrs_per_nodes_packet: usize = 3;
+
+const PeerEnrEntry = struct {
+    id: NodeId,
+    raw: []u8,
+};
+
 pub const Node = struct {
     const PendingChallenge = struct {
         peer_id: NodeId,
@@ -43,6 +54,8 @@ pub const Node = struct {
     enr_seq: u64,
     sessions: session.SessionTable,
     routing: routing.RoutingTable,
+    /// Raw ENR RLP bytes keyed by node id (e.g. from verified inbound handshakes). Used for NODES replies.
+    peer_enrs: std.ArrayList(PeerEnrEntry),
     pending: std.ArrayList(PendingChallenge),
     outbound: std.ArrayList(OutboundHandshake),
 
@@ -59,16 +72,41 @@ pub const Node = struct {
             .enr_seq = cfg.enr_seq,
             .sessions = sessions,
             .routing = routing.RoutingTable.init(nid),
+            .peer_enrs = .empty,
             .pending = .empty,
             .outbound = .empty,
         };
     }
 
     pub fn deinit(self: *Node) void {
+        for (self.peer_enrs.items) |e| self.allocator.free(e.raw);
+        self.peer_enrs.deinit(self.allocator);
         for (self.pending.items) |p| self.allocator.free(p.challenge_data);
         self.pending.deinit(self.allocator);
         self.outbound.deinit(self.allocator);
         self.sessions.deinit();
+    }
+
+    /// Stores or replaces the cached raw ENR for `node_id` (e.g. after a verified handshake).
+    pub fn rememberPeerRecord(self: *Node, node_id: NodeId, raw_enr: []const u8) std.mem.Allocator.Error!void {
+        const alloc = self.allocator;
+        const dup = try alloc.dupe(u8, raw_enr);
+        errdefer alloc.free(dup);
+        for (self.peer_enrs.items) |*e| {
+            if (std.mem.eql(u8, &e.id, &node_id)) {
+                alloc.free(e.raw);
+                e.raw = dup;
+                return;
+            }
+        }
+        try self.peer_enrs.append(alloc, .{ .id = node_id, .raw = dup });
+    }
+
+    fn peerRecordBytes(self: *const Node, node_id: NodeId) ?[]const u8 {
+        for (self.peer_enrs.items) |e| {
+            if (std.mem.eql(u8, &e.id, &node_id)) return e.raw;
+        }
+        return null;
     }
 
     pub fn makeEndpoint(_: *const Node, peer_id: NodeId, ip: session.IpAddr, port: u16) session.UdpEndpoint {
@@ -114,7 +152,7 @@ pub const Node = struct {
         packet.EncodeError ||
         routing.Error ||
         std.mem.Allocator.Error ||
-        error{ MissingHandshakePending, EmptyHandshakeRecord, EnrNodeIdMismatch, BadHandshakeSignatureLength };
+        error{ MissingHandshakePending, EmptyHandshakeRecord, EnrNodeIdMismatch, BadHandshakeSignatureLength, FindnodeResponseTooLarge };
 
     fn clearOutboundForPeer(self: *Node, peer_id: NodeId) void {
         var i: usize = 0;
@@ -288,10 +326,23 @@ pub const Node = struct {
             const plain = try message_crypto.decryptOrdinaryMessage(alloc, copy, &parsed, read_key);
             defer alloc.free(plain);
 
-            const decoded = try message.decodePlaintext(plain, alloc);
+            var decoded = try message.decodePlaintext(plain, alloc);
+            defer decoded.deinit(alloc);
             switch (decoded) {
                 .ping => |p| {
                     const reply = try self.buildEncryptedPong(remote, ep, lu, p);
+                    errdefer alloc.free(reply);
+                    try responses_out.append(alloc, reply);
+                },
+                .findnode => |f| {
+                    if (!findnodeDistancesOk(f.distances)) return;
+                    try self.appendFindnodeResponses(ep, lu, f.req_id, f.distances, responses_out);
+                },
+                .talkreq => |t| {
+                    if (t.protocol.len == 0) return;
+                    const resp_pt = try message.encodeTalkResponsePlaintext(alloc, t.req_id, t.message);
+                    defer alloc.free(resp_pt);
+                    const reply = try self.buildEncryptedOrdinaryReply(ep, lu, resp_pt);
                     errdefer alloc.free(reply);
                     try responses_out.append(alloc, reply);
                 },
@@ -322,12 +373,11 @@ pub const Node = struct {
         try responses_out.append(alloc, way);
     }
 
-    fn buildEncryptedPong(
+    fn buildEncryptedOrdinaryReply(
         self: *Node,
-        remote: RemoteUdp,
         ep: session.UdpEndpoint,
         lu: session.SessionLookup,
-        ping: message.Ping,
+        plaintext: []const u8,
     ) ReceiveError![]u8 {
         const alloc = self.allocator;
 
@@ -351,17 +401,83 @@ pub const Node = struct {
         else
             lu.session.writeKeyWeWereInitiator();
 
+        const ct = try message_crypto.encryptMessage(alloc, write_key, msg_nonce, plaintext, ad);
+        defer alloc.free(ct);
+
+        return packet.encodeOrdinaryMessagePacket(alloc, ep.node_id, iv, msg_nonce, self.node_id, ct);
+    }
+
+    fn buildEncryptedPong(
+        self: *Node,
+        remote: RemoteUdp,
+        ep: session.UdpEndpoint,
+        lu: session.SessionLookup,
+        ping: message.Ping,
+    ) ReceiveError![]u8 {
+        const alloc = self.allocator;
         const ip_slice: []const u8 = switch (remote.ip) {
             .v4 => |a| &a,
             .v6 => |a| &a,
         };
         const pong_pt = try message.encodePongPlaintext(alloc, ping.req_id, self.enr_seq, ip_slice, remote.port);
         defer alloc.free(pong_pt);
+        return self.buildEncryptedOrdinaryReply(ep, lu, pong_pt);
+    }
 
-        const ct = try message_crypto.encryptMessage(alloc, write_key, msg_nonce, pong_pt, ad);
-        defer alloc.free(ct);
+    fn appendFindnodeResponses(
+        self: *Node,
+        ep: session.UdpEndpoint,
+        lu: session.SessionLookup,
+        req_id: []const u8,
+        distances: []const u32,
+        responses_out: *std.ArrayList([]u8),
+    ) ReceiveError!void {
+        const alloc = self.allocator;
 
-        return packet.encodeOrdinaryMessagePacket(alloc, ep.node_id, iv, msg_nonce, self.node_id, ct);
+        var id_candidates: std.ArrayList(NodeId) = .empty;
+        defer id_candidates.deinit(alloc);
+        try self.routing.appendNodesForLogDistances(distances, alloc, &id_candidates);
+
+        var deduped: std.ArrayList(NodeId) = .empty;
+        defer deduped.deinit(alloc);
+        outer: for (id_candidates.items) |nid| {
+            for (deduped.items) |e| {
+                if (std.mem.eql(u8, &e, &nid)) continue :outer;
+            }
+            try deduped.append(alloc, nid);
+        }
+
+        var payloads: std.ArrayList([]const u8) = .empty;
+        defer payloads.deinit(alloc);
+        for (deduped.items) |nid| {
+            if (self.peerRecordBytes(nid)) |raw| try payloads.append(alloc, raw);
+        }
+
+        const n = payloads.items.len;
+        if (n == 0) {
+            const pt = try message.encodeNodesPlaintext(alloc, req_id, 1, &[0][]const u8{});
+            defer alloc.free(pt);
+            const pkt = try self.buildEncryptedOrdinaryReply(ep, lu, pt);
+            errdefer alloc.free(pkt);
+            try responses_out.append(alloc, pkt);
+            return;
+        }
+
+        const packet_count = (n + max_enrs_per_nodes_packet - 1) / max_enrs_per_nodes_packet;
+        if (packet_count > 255) return error.FindnodeResponseTooLarge;
+        const resp_count: u8 = @intCast(packet_count);
+
+        var start: usize = 0;
+        while (start < n) {
+            const end = @min(start + max_enrs_per_nodes_packet, n);
+            const slice = payloads.items[start..end];
+            const pt = try message.encodeNodesPlaintext(alloc, req_id, resp_count, slice);
+            defer alloc.free(pt);
+            const pkt = try self.buildEncryptedOrdinaryReply(ep, lu, pt);
+            errdefer alloc.free(pkt);
+            try responses_out.append(alloc, pkt);
+            start = end;
+        }
     }
 
     fn handleHandshake(
@@ -399,6 +515,8 @@ pub const Node = struct {
         const keys = handshake.deriveSessionKeys(&ikm, challenge_data, initiator_id, self.node_id);
         try identity_v4.verifyIdentityProof(sig, challenge_data, hs.eph_pubkey, self.node_id, pk);
 
+        try self.rememberPeerRecord(initiator_id, hs.record);
+
         const ep = self.makeEndpoint(initiator_id, remote.ip, remote.port);
         try self.sessions.put(ep, session.CachedSession.fromDerived(keys), true);
         _ = try self.routing.add(initiator_id);
@@ -409,7 +527,8 @@ pub const Node = struct {
         const ad = message_crypto.messageAdditionalData(copy, &parsed);
         const plain = try message_crypto.decryptMessage(alloc, read_key, parsed.header.nonce, parsed.message_cipher, ad);
         defer alloc.free(plain);
-        const decoded = try message.decodePlaintext(plain, alloc);
+        var decoded = try message.decodePlaintext(plain, alloc);
+        defer decoded.deinit(alloc);
         switch (decoded) {
             .ping => |p| {
                 const lu = self.sessions.get(ep) orelse unreachable;
@@ -421,6 +540,15 @@ pub const Node = struct {
         }
     }
 };
+
+fn findnodeDistancesOk(distances: []const u32) bool {
+    if (distances.len == 0) return false;
+    if (distances.len > max_findnode_distances) return false;
+    for (distances) |d| {
+        if (d > 255) return false;
+    }
+    return true;
+}
 
 var g_entropy_counter = std.atomic.Value(u64).init(0x14650fb0739d0383);
 
@@ -810,6 +938,140 @@ test "initiator opening ping completes handshake after WHOAREYOU" {
     const plain = try message_crypto.decryptOrdinaryMessage(alloc, pong_copy, &parsed_pong, read_key);
     defer alloc.free(plain);
     const msg2 = try message.decodePlaintext(plain, alloc);
+    defer msg2.deinit(alloc);
     try std.testing.expect(msg2 == .pong);
     try std.testing.expectEqualSlices(u8, &.{ 0x01, 0x02 }, msg2.pong.req_id);
+}
+
+test "session findnode returns encrypted nodes for cached peer enrs" {
+    const alloc = std.testing.allocator;
+
+    var sk_b: [32]u8 = @splat(0);
+    sk_b[31] = 17;
+    var node_b = try Node.init(alloc, .{ .secret_key = sk_b });
+    defer node_b.deinit();
+
+    var sk_a: [32]u8 = @splat(0);
+    sk_a[31] = 19;
+    const id_a = try identity_v4.nodeIdV4FromSecretKey(sk_a);
+
+    var id_c: NodeId = @splat(0);
+    id_c[0] = 0x80;
+    const d = routing.logDistance(node_b.node_id, id_c).?;
+    _ = try node_b.routing.add(id_c);
+    try node_b.rememberPeerRecord(id_c, &.{ 0xde, 0xad, 0xbe, 0xef });
+
+    const ikm = [_]u8{0x0c} ++ [_]u8{0x44} ** 32;
+    const challenge = [_]u8{0x88} ** (packet.static_prefix_size + packet.whoareyou_auth_size);
+    const keys = handshake.deriveSessionKeys(&ikm, &challenge, id_a, node_b.node_id);
+
+    const ep = node_b.makeEndpoint(id_a, .{ .v4 = .{ 172, 16, 0, 5 } }, 30305);
+    try node_b.sessions.put(ep, session.CachedSession.fromDerived(keys), true);
+
+    var iv: [16]u8 = undefined;
+    @memset(&iv, 0x4d);
+    var nonce: [12]u8 = undefined;
+    @memset(&nonce, 0x2e);
+
+    const fn_pt = try message.encodeFindnodePlaintext(alloc, &.{0x9c}, &[_]u32{d});
+    defer alloc.free(fn_pt);
+
+    var prefix: [packet.static_prefix_size + packet.message_auth_size]u8 = undefined;
+    @memcpy(prefix[0..16], &iv);
+    var static_plain: [packet.static_header_size]u8 = undefined;
+    packet.writePlaintextStaticHeader(&static_plain, .message, nonce, packet.message_auth_size);
+    @memcpy(prefix[16..][0..packet.static_header_size], &static_plain);
+    @memcpy(prefix[packet.static_prefix_size..][0..packet.message_auth_size], &id_a);
+
+    const ct = try message_crypto.encryptMessage(alloc, keys.initiator_key, nonce, fn_pt, &prefix);
+    defer alloc.free(ct);
+
+    const ordinary = try packet.encodeOrdinaryMessagePacket(alloc, node_b.node_id, iv, nonce, id_a, ct);
+    defer alloc.free(ordinary);
+
+    var responses: std.ArrayList([]u8) = .empty;
+    defer {
+        for (responses.items) |s| alloc.free(s);
+        responses.deinit(alloc);
+    }
+
+    const remote: RemoteUdp = .{ .ip = ep.ip, .port = ep.port };
+    try node_b.handleReceive(remote, ordinary, &responses);
+
+    try std.testing.expectEqual(@as(usize, 1), responses.items.len);
+
+    const wire = try alloc.dupe(u8, responses.items[0]);
+    defer alloc.free(wire);
+    const parsed = try packet.decodeInPlace(&id_a, wire);
+    const plain = try message_crypto.decryptOrdinaryMessage(alloc, wire, &parsed, keys.recipient_key);
+    defer alloc.free(plain);
+    var dec = try message.decodePlaintext(plain, alloc);
+    defer dec.deinit(alloc);
+    try std.testing.expect(dec == .nodes);
+    try std.testing.expectEqual(@as(u8, 1), dec.nodes.resp_count);
+    try std.testing.expectEqual(@as(usize, 1), dec.nodes.enr_records.len);
+    try std.testing.expectEqualSlices(u8, &.{ 0xde, 0xad, 0xbe, 0xef }, dec.nodes.enr_records[0]);
+}
+
+test "session talkreq yields talkresp echoing message payload" {
+    const alloc = std.testing.allocator;
+
+    var sk_b: [32]u8 = @splat(0);
+    sk_b[31] = 23;
+    var node_b = try Node.init(alloc, .{ .secret_key = sk_b });
+    defer node_b.deinit();
+
+    var sk_a: [32]u8 = @splat(0);
+    sk_a[31] = 29;
+    const id_a = try identity_v4.nodeIdV4FromSecretKey(sk_a);
+
+    const ikm = [_]u8{0x0d} ++ [_]u8{0x55} ** 32;
+    const challenge = [_]u8{0x99} ** (packet.static_prefix_size + packet.whoareyou_auth_size);
+    const keys = handshake.deriveSessionKeys(&ikm, &challenge, id_a, node_b.node_id);
+
+    const ep = node_b.makeEndpoint(id_a, .{ .v4 = .{ 192, 0, 2, 3 } }, 40443);
+    try node_b.sessions.put(ep, session.CachedSession.fromDerived(keys), true);
+
+    var iv: [16]u8 = undefined;
+    @memset(&iv, 0x71);
+    var nonce: [12]u8 = undefined;
+    @memset(&nonce, 0x82);
+
+    const tq = try message.encodeTalkRequestPlaintext(alloc, &.{ 0x01, 0x02 }, "eth/66", "hello");
+    defer alloc.free(tq);
+
+    var prefix: [packet.static_prefix_size + packet.message_auth_size]u8 = undefined;
+    @memcpy(prefix[0..16], &iv);
+    var static_plain: [packet.static_header_size]u8 = undefined;
+    packet.writePlaintextStaticHeader(&static_plain, .message, nonce, packet.message_auth_size);
+    @memcpy(prefix[16..][0..packet.static_header_size], &static_plain);
+    @memcpy(prefix[packet.static_prefix_size..][0..packet.message_auth_size], &id_a);
+
+    const ct = try message_crypto.encryptMessage(alloc, keys.initiator_key, nonce, tq, &prefix);
+    defer alloc.free(ct);
+
+    const ordinary = try packet.encodeOrdinaryMessagePacket(alloc, node_b.node_id, iv, nonce, id_a, ct);
+    defer alloc.free(ordinary);
+
+    var responses: std.ArrayList([]u8) = .empty;
+    defer {
+        for (responses.items) |s| alloc.free(s);
+        responses.deinit(alloc);
+    }
+
+    const remote: RemoteUdp = .{ .ip = ep.ip, .port = ep.port };
+    try node_b.handleReceive(remote, ordinary, &responses);
+
+    try std.testing.expectEqual(@as(usize, 1), responses.items.len);
+
+    const wire = try alloc.dupe(u8, responses.items[0]);
+    defer alloc.free(wire);
+    const parsed = try packet.decodeInPlace(&id_a, wire);
+    const plain = try message_crypto.decryptOrdinaryMessage(alloc, wire, &parsed, keys.recipient_key);
+    defer alloc.free(plain);
+    var dec = try message.decodePlaintext(plain, alloc);
+    defer dec.deinit(alloc);
+    try std.testing.expect(dec == .talkresp);
+    try std.testing.expectEqualSlices(u8, &.{ 0x01, 0x02 }, dec.talkresp.req_id);
+    try std.testing.expectEqualSlices(u8, "hello", dec.talkresp.response);
 }
