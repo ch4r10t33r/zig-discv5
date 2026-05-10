@@ -3,6 +3,11 @@
 //!
 //! Pass a shared **`now_ms`** clock into **handleReceive** so optional session TTL, pending WHOAREYOU TTL,
 //! and decrypt-fail recovery (drop session → WHOAREYOU) behave deterministically.
+//!
+//! Routing table: **FINDNODE** only returns peers with **ping_replied** (discv5-theory). Handshake completion
+//! marks the peer verified; for strict PING tracking call **registerOutboundPing** before sending an encrypted
+//! PING, then an inbound **PONG** with the same **req_id** sets **ping_replied**. Use **RoutingTable.pickStaleBucketForRefresh**
+//! / **markBucketRefreshed** for periodic bucket refresh.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -39,6 +44,9 @@ const max_findnode_distances: usize = 32;
 /// Max ENR payloads per NODES packet (conservative; keeps UDP datagrams under typical MTU).
 const max_enrs_per_nodes_packet: usize = 3;
 
+/// Upper bound on remembered outbound PING **req_id**s for PONG correlation.
+const outbound_ping_track_cap: usize = 128;
+
 const PeerEnrEntry = struct {
     id: NodeId,
     raw: []u8,
@@ -65,6 +73,11 @@ pub const Node = struct {
         message_nonce: [12]u8,
     };
 
+    const OutboundPing = struct {
+        peer_id: NodeId,
+        req_id: []u8,
+    };
+
     allocator: std.mem.Allocator,
     secret_key: [32]u8,
     node_id: NodeId,
@@ -77,6 +90,7 @@ pub const Node = struct {
     peer_enrs: std.ArrayList(PeerEnrEntry),
     pending: std.ArrayList(PendingChallenge),
     outbound: std.ArrayList(OutboundHandshake),
+    outbound_pings: std.ArrayList(OutboundPing),
 
     pub const InitError = identity_v4.EcdhError || session.InitError;
 
@@ -96,6 +110,7 @@ pub const Node = struct {
             .peer_enrs = .empty,
             .pending = .empty,
             .outbound = .empty,
+            .outbound_pings = .empty,
         };
     }
 
@@ -107,8 +122,38 @@ pub const Node = struct {
             if (p.cached_initiator_record) |r| self.allocator.free(r);
         }
         self.pending.deinit(self.allocator);
+        for (self.outbound_pings.items) |e| self.allocator.free(e.req_id);
+        self.outbound_pings.deinit(self.allocator);
         self.outbound.deinit(self.allocator);
         self.sessions.deinit();
+    }
+
+    /// Register the **req_id** of an encrypted PING about to be sent to **peer_id**. A matching inbound **PONG**
+    /// marks the peer **ping_replied** in the routing table. Evicts oldest entries when over capacity.
+    pub fn registerOutboundPing(self: *Node, peer_id: NodeId, req_id: []const u8) std.mem.Allocator.Error!void {
+        const alloc = self.allocator;
+        while (self.outbound_pings.items.len >= outbound_ping_track_cap) {
+            const old = self.outbound_pings.orderedRemove(0);
+            alloc.free(old.req_id);
+        }
+        const dup = try alloc.dupe(u8, req_id);
+        errdefer alloc.free(dup);
+        try self.outbound_pings.append(alloc, .{ .peer_id = peer_id, .req_id = dup });
+    }
+
+    fn consumeOutboundPingForPong(self: *Node, peer_id: NodeId, req_id: []const u8) void {
+        const alloc = self.allocator;
+        var i: usize = 0;
+        while (i < self.outbound_pings.items.len) {
+            const e = self.outbound_pings.items[i];
+            if (std.mem.eql(u8, &e.peer_id, &peer_id) and std.mem.eql(u8, e.req_id, req_id)) {
+                alloc.free(e.req_id);
+                _ = self.outbound_pings.swapRemove(i);
+                _ = self.routing.markPingReplied(peer_id);
+                return;
+            }
+            i += 1;
+        }
     }
 
     /// Stores or replaces the cached raw ENR for `node_id` (e.g. after a verified handshake).
@@ -371,6 +416,7 @@ pub const Node = struct {
         errdefer _ = self.sessions.remove(ep);
 
         _ = try self.routing.add(o.peer_id);
+        _ = self.routing.markPingReplied(o.peer_id);
 
         try responses_out.append(alloc, hs_pkt);
     }
@@ -471,6 +517,9 @@ pub const Node = struct {
                     const reply = try self.buildEncryptedPong(remote, ep, lu, p);
                     errdefer alloc.free(reply);
                     try responses_out.append(alloc, reply);
+                },
+                .pong => |p| {
+                    self.consumeOutboundPingForPong(src_id, p.req_id);
                 },
                 .findnode => |f| {
                     if (!findnodeDistancesOk(f.distances)) return;
@@ -646,6 +695,7 @@ pub const Node = struct {
         const ep = self.makeEndpoint(initiator_id, remote.ip, remote.port);
         try self.sessions.put(ep, session.CachedSession.fromDerived(keys), true, now_ms);
         _ = try self.routing.add(initiator_id);
+        _ = self.routing.markPingReplied(initiator_id);
 
         if (parsed.message_cipher.len == 0) return;
 
@@ -834,6 +884,67 @@ test "session present ping yields encrypted pong" {
     const dec = try message.decodePlaintext(plain, alloc);
     try std.testing.expect(dec == .pong);
     try std.testing.expectEqualSlices(u8, &.{ 0xaa, 0xbb }, dec.pong.req_id);
+}
+
+test "inbound pong with registered req_id marks routing ping_replied" {
+    const alloc = std.testing.allocator;
+
+    var sk_b: [32]u8 = @splat(0);
+    sk_b[31] = 11;
+    var node_b = try Node.init(alloc, .{ .secret_key = sk_b });
+    defer node_b.deinit();
+
+    var sk_a: [32]u8 = @splat(0);
+    sk_a[31] = 13;
+    const id_a = try identity_v4.nodeIdV4FromSecretKey(sk_a);
+
+    _ = try node_b.routing.add(id_a);
+    try std.testing.expect(!node_b.routing.pingReplied(id_a));
+    try node_b.registerOutboundPing(id_a, &.{ 0x99, 0x01 });
+
+    const ikm = [_]u8{0x02} ++ [_]u8{0x33} ** 32;
+    const challenge = [_]u8{0x77} ** (packet.static_prefix_size + packet.whoareyou_auth_size);
+    const keys = handshake.deriveSessionKeys(&ikm, &challenge, id_a, node_b.node_id);
+
+    const ep = node_b.makeEndpoint(id_a, .{ .v4 = .{ 192, 168, 1, 20 } }, 9000);
+    try node_b.sessions.put(ep, session.CachedSession.fromDerived(keys), true, 0);
+
+    const remote: RemoteUdp = .{ .ip = ep.ip, .port = ep.port };
+    const ip_slice: []const u8 = switch (remote.ip) {
+        .v4 => |a| &a,
+        .v6 => |a| &a,
+    };
+
+    var iv: [16]u8 = undefined;
+    @memset(&iv, 0x2f);
+    var nonce: [12]u8 = undefined;
+    @memset(&nonce, 0x4a);
+
+    const pong_pt = try message.encodePongPlaintext(alloc, &.{ 0x99, 0x01 }, 0, ip_slice, remote.port);
+    defer alloc.free(pong_pt);
+
+    var prefix: [packet.static_prefix_size + packet.message_auth_size]u8 = undefined;
+    @memcpy(prefix[0..16], &iv);
+    var static_plain: [packet.static_header_size]u8 = undefined;
+    packet.writePlaintextStaticHeader(&static_plain, .message, nonce, packet.message_auth_size);
+    @memcpy(prefix[16..][0..packet.static_header_size], &static_plain);
+    @memcpy(prefix[packet.static_prefix_size..][0..packet.message_auth_size], &id_a);
+
+    const ct = try message_crypto.encryptMessage(alloc, keys.initiator_key, nonce, pong_pt, &prefix);
+    defer alloc.free(ct);
+
+    const ordinary = try packet.encodeOrdinaryMessagePacket(alloc, node_b.node_id, iv, nonce, id_a, ct);
+    defer alloc.free(ordinary);
+
+    var responses: std.ArrayList([]u8) = .empty;
+    defer {
+        for (responses.items) |s| alloc.free(s);
+        responses.deinit(alloc);
+    }
+
+    try node_b.handleReceive(remote, ordinary, &responses, 0);
+    try std.testing.expectEqual(@as(usize, 0), responses.items.len);
+    try std.testing.expect(node_b.routing.pingReplied(id_a));
 }
 
 test "responder completes handshake and answers ping inside handshake" {
@@ -1180,6 +1291,7 @@ test "session findnode returns encrypted nodes for cached peer enrs" {
     id_c[0] = 0x80;
     const d = routing.logDistance(node_b.node_id, id_c).?;
     _ = try node_b.routing.add(id_c);
+    try std.testing.expect(node_b.routing.markPingReplied(id_c));
     try node_b.rememberPeerRecord(id_c, &.{ 0xde, 0xad, 0xbe, 0xef });
 
     const ikm = [_]u8{0x0c} ++ [_]u8{0x44} ** 32;

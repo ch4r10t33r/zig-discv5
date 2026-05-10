@@ -1,5 +1,7 @@
 //! Kademlia-style node table per [discv5-theory](https://github.com/ethereum/devp2p/blob/master/discv5/discv5-theory.md):
 //! 256 buckets by logarithmic XOR distance, `k = 16` entries per bucket, LRU at index 0 and MRU at the tail.
+//! Each slot tracks whether the peer has been liveness-verified (spec: only relay in FINDNODE after a successful
+//! PING/PONG or equivalent). **last_lookup_ms** supports "least recently refreshed bucket" maintenance.
 
 const std = @import("std");
 
@@ -13,6 +15,14 @@ pub const replacement_k: usize = 16;
 
 pub const Error = error{
     CannotAddSelf,
+};
+
+/// One row in a k-bucket or replacement cache.
+pub const TableEntry = struct {
+    id: NodeId,
+    /// True once the peer has responded to our PING (see **registerOutboundPing**) or after a completed handshake
+    /// (treated as verified reachability for relay policy).
+    ping_replied: bool,
 };
 
 /// Bitwise XOR of two node IDs interpreted as big-endian integers.
@@ -40,31 +50,31 @@ pub fn cmpXorToTarget(a: NodeId, b: NodeId, target: NodeId) std.math.Order {
 }
 
 const Bucket = struct {
-    nodes: [bucket_k]NodeId = undefined,
+    nodes: [bucket_k]TableEntry = undefined,
     len: u8 = 0,
 
     fn find(self: *const Bucket, id: NodeId) ?usize {
         for (self.nodes[0..self.len], 0..) |n, i| {
-            if (std.mem.eql(u8, &n, &id)) return i;
+            if (std.mem.eql(u8, &n.id, &id)) return i;
         }
         return null;
     }
 
     fn moveToMru(self: *Bucket, idx: usize) void {
         if (idx + 1 == self.len) return;
-        const id = self.nodes[idx];
+        const ent = self.nodes[idx];
         for (idx..self.len - 1) |j| {
             self.nodes[j] = self.nodes[j + 1];
         }
-        self.nodes[self.len - 1] = id;
+        self.nodes[self.len - 1] = ent;
     }
 
-    fn appendMru(self: *Bucket, id: NodeId) void {
-        self.nodes[self.len] = id;
+    fn appendMru(self: *Bucket, ent: TableEntry) void {
+        self.nodes[self.len] = ent;
         self.len += 1;
     }
 
-    fn removeLru(self: *Bucket) NodeId {
+    fn removeLru(self: *Bucket) TableEntry {
         const out = self.nodes[0];
         for (1..self.len) |i| {
             self.nodes[i - 1] = self.nodes[i];
@@ -82,31 +92,31 @@ const Bucket = struct {
 };
 
 const ReplacementCache = struct {
-    nodes: [replacement_k]NodeId = undefined,
+    nodes: [replacement_k]TableEntry = undefined,
     len: u8 = 0,
 
     fn find(self: *const ReplacementCache, id: NodeId) ?usize {
         for (self.nodes[0..self.len], 0..) |n, i| {
-            if (std.mem.eql(u8, &n, &id)) return i;
+            if (std.mem.eql(u8, &n.id, &id)) return i;
         }
         return null;
     }
 
     fn moveToMru(self: *ReplacementCache, idx: usize) void {
         if (idx + 1 == self.len) return;
-        const id = self.nodes[idx];
+        const ent = self.nodes[idx];
         for (idx..self.len - 1) |j| {
             self.nodes[j] = self.nodes[j + 1];
         }
-        self.nodes[self.len - 1] = id;
+        self.nodes[self.len - 1] = ent;
     }
 
-    fn appendMru(self: *ReplacementCache, id: NodeId) void {
-        self.nodes[self.len] = id;
+    fn appendMru(self: *ReplacementCache, ent: TableEntry) void {
+        self.nodes[self.len] = ent;
         self.len += 1;
     }
 
-    fn removeLru(self: *ReplacementCache) NodeId {
+    fn removeLru(self: *ReplacementCache) TableEntry {
         const out = self.nodes[0];
         for (1..self.len) |i| {
             self.nodes[i - 1] = self.nodes[i];
@@ -116,17 +126,17 @@ const ReplacementCache = struct {
     }
 
     /// Insert or refresh MRU; if full, drops the replacement LRU before appending.
-    fn push(self: *ReplacementCache, id: NodeId) void {
-        if (self.find(id)) |i| {
+    fn push(self: *ReplacementCache, ent: TableEntry) void {
+        if (self.find(ent.id)) |i| {
             self.moveToMru(i);
             return;
         }
         if (self.len < replacement_k) {
-            self.appendMru(id);
+            self.appendMru(ent);
             return;
         }
         _ = self.removeLru();
-        self.appendMru(id);
+        self.appendMru(ent);
     }
 
     fn removeIfPresent(self: *ReplacementCache, id: NodeId) bool {
@@ -151,6 +161,8 @@ pub const RoutingTable = struct {
     local_id: NodeId,
     buckets: [256]Bucket = @splat(.{}),
     replacements: [256]ReplacementCache = @splat(.{}),
+    /// Application updates this after performing a lookup / refresh that targeted each bucket (discv5-theory).
+    last_bucket_lookup_ms: [256]u64 = @splat(0),
 
     pub fn init(local_id: NodeId) RoutingTable {
         return .{ .local_id = local_id };
@@ -161,12 +173,38 @@ pub const RoutingTable = struct {
         const rep = &self.replacements[bidx];
         if (bucket.len >= bucket_k) return;
         if (rep.len == 0) return;
-        const id = rep.removeLru();
-        if (bucket.find(id) != null) return;
-        bucket.appendMru(id);
+        const ent = rep.removeLru();
+        if (bucket.find(ent.id) != null) return;
+        bucket.appendMru(ent);
     }
 
-    /// Inserts or refreshes a peer. The local node ID is rejected.
+    /// Sets **ping_replied** for `node` if it appears in a bucket or replacement cache.
+    pub fn markPingReplied(self: *RoutingTable, node: NodeId) bool {
+        const bidx = logDistance(self.local_id, node) orelse return false;
+        const bucket = &self.buckets[bidx];
+        if (bucket.find(node)) |i| {
+            bucket.nodes[i].ping_replied = true;
+            return true;
+        }
+        const rep = &self.replacements[bidx];
+        if (rep.find(node)) |i| {
+            rep.nodes[i].ping_replied = true;
+            return true;
+        }
+        return false;
+    }
+
+    /// Whether `node` is in the table with **ping_replied** set (including replacement cache).
+    pub fn pingReplied(self: *const RoutingTable, node: NodeId) bool {
+        const bidx = logDistance(self.local_id, node) orelse return false;
+        const bucket = &self.buckets[bidx];
+        if (bucket.find(node)) |i| return bucket.nodes[i].ping_replied;
+        const rep = &self.replacements[bidx];
+        if (rep.find(node)) |i| return rep.nodes[i].ping_replied;
+        return false;
+    }
+
+    /// Inserts or refreshes a peer. The local node ID is rejected. New entries start with **ping_replied = false**.
     pub fn add(self: *RoutingTable, node: NodeId) Error!AddResult {
         if (std.mem.eql(u8, &node, &self.local_id)) return error.CannotAddSelf;
         const bidx = logDistance(self.local_id, node) orelse return error.CannotAddSelf;
@@ -179,12 +217,12 @@ pub const RoutingTable = struct {
         }
 
         if (bucket.len < bucket_k) {
-            bucket.appendMru(node);
+            bucket.appendMru(.{ .id = node, .ping_replied = false });
             return .inserted;
         }
 
-        self.replacements[bidx].push(node);
-        return .{ .bucket_full = .{ .lru = bucket.nodes[0] } };
+        self.replacements[bidx].push(.{ .id = node, .ping_replied = false });
+        return .{ .bucket_full = .{ .lru = bucket.nodes[0].id } };
     }
 
     /// Removes the least recently seen entry from the bucket that would hold `node`, then inserts `node`.
@@ -202,7 +240,7 @@ pub const RoutingTable = struct {
             return;
         }
         _ = bucket.removeLru();
-        bucket.appendMru(node);
+        bucket.appendMru(.{ .id = node, .ping_replied = false });
         _ = self.replacements[bidx].removeIfPresent(node);
     }
 
@@ -218,8 +256,8 @@ pub const RoutingTable = struct {
         return true;
     }
 
-    /// Appends every node stored in buckets whose indices appear in `distances` (logarithmic distances).
-    /// Duplicate indices in `distances` may yield duplicate IDs in `out`.
+    /// Appends node IDs from buckets for the given logarithmic distances. Only entries with **ping_replied**
+    /// are included (discv5-theory: do not relay unverified peers in FINDNODE responses).
     pub fn appendNodesForLogDistances(
         self: *const RoutingTable,
         distances: []const u32,
@@ -229,7 +267,9 @@ pub const RoutingTable = struct {
         for (distances) |d| {
             if (d > 255) continue;
             const b = self.buckets[d];
-            try out.appendSlice(allocator, b.nodes[0..b.len]);
+            for (b.nodes[0..b.len]) |ent| {
+                if (ent.ping_replied) try out.append(allocator, ent.id);
+            }
         }
     }
 
@@ -244,7 +284,9 @@ pub const RoutingTable = struct {
         defer tmp.deinit(allocator);
 
         for (self.buckets) |b| {
-            try tmp.appendSlice(allocator, b.nodes[0..b.len]);
+            for (b.nodes[0..b.len]) |ent| {
+                try tmp.append(allocator, ent.id);
+            }
         }
         if (tmp.items.len == 0) {
             return try allocator.alloc(NodeId, 0);
@@ -264,7 +306,7 @@ pub const RoutingTable = struct {
         return out;
     }
 
-    /// Total number of stored peers.
+    /// Total number of stored peers (buckets only, not replacement caches).
     pub fn count(self: *const RoutingTable) usize {
         var n: usize = 0;
         for (self.buckets) |b| {
@@ -280,6 +322,28 @@ pub const RoutingTable = struct {
             n += r.len;
         }
         return n;
+    }
+
+    /// Call after the application performed a table refresh / lookup that covered `bucket_index`.
+    pub fn markBucketRefreshed(self: *RoutingTable, bucket_index: u8, now_ms: u64) void {
+        self.last_bucket_lookup_ms[bucket_index] = now_ms;
+    }
+
+    /// Picks a non-empty bucket whose last refresh is oldest, among those with
+    /// `now_ms - last_bucket_lookup_ms >= min_interval_ms`. Returns `null` if none qualify or all buckets empty.
+    pub fn pickStaleBucketForRefresh(self: *const RoutingTable, now_ms: u64, min_interval_ms: u64) ?u8 {
+        var best_idx: ?u8 = null;
+        var best_t: u64 = 0;
+        for (self.buckets, 0..) |b, i| {
+            if (b.len == 0) continue;
+            const t = self.last_bucket_lookup_ms[i];
+            if (now_ms -| t < min_interval_ms) continue;
+            if (best_idx == null or t < best_t) {
+                best_idx = @intCast(i);
+                best_t = t;
+            }
+        }
+        return best_idx;
     }
 };
 
@@ -308,12 +372,12 @@ test "add MRU order and bucket full" {
     try std.testing.expect((try t.add(n_a)) == .inserted);
     try std.testing.expect((try t.add(n_b)) == .inserted);
     try std.testing.expectEqual(@as(usize, 2), t.buckets[5].len);
-    try std.testing.expectEqualSlices(u8, &n_a, &t.buckets[5].nodes[0]);
-    try std.testing.expectEqualSlices(u8, &n_b, &t.buckets[5].nodes[1]);
+    try std.testing.expectEqualSlices(u8, &n_a, &t.buckets[5].nodes[0].id);
+    try std.testing.expectEqualSlices(u8, &n_b, &t.buckets[5].nodes[1].id);
 
     try std.testing.expect((try t.add(n_a)) == .updated);
-    try std.testing.expectEqualSlices(u8, &n_b, &t.buckets[5].nodes[0]);
-    try std.testing.expectEqualSlices(u8, &n_a, &t.buckets[5].nodes[1]);
+    try std.testing.expectEqualSlices(u8, &n_b, &t.buckets[5].nodes[0].id);
+    try std.testing.expectEqualSlices(u8, &n_a, &t.buckets[5].nodes[1].id);
 
     try std.testing.expectError(error.CannotAddSelf, t.add(local));
 
@@ -326,10 +390,10 @@ test "add MRU order and bucket full" {
     overflow[31] = 32 + bucket_k;
     const r = try t.add(overflow);
     try std.testing.expect(r == .bucket_full);
-    try std.testing.expectEqualSlices(u8, &t.buckets[5].nodes[0], &r.bucket_full.lru);
+    try std.testing.expectEqualSlices(u8, &t.buckets[5].nodes[0].id, &r.bucket_full.lru);
 
     try t.replaceLruInBucketOf(overflow);
-    try std.testing.expectEqualSlices(u8, &overflow, &t.buckets[5].nodes[bucket_k - 1]);
+    try std.testing.expectEqualSlices(u8, &overflow, &t.buckets[5].nodes[bucket_k - 1].id);
 }
 
 test "closest ordering" {
@@ -373,14 +437,14 @@ test "replacement cache and promote on remove" {
     try std.testing.expect(r == .bucket_full);
     try std.testing.expectEqual(@as(usize, 1), t.countReplacements());
 
-    const victim = t.buckets[5].nodes[0];
+    const victim = t.buckets[5].nodes[0].id;
     try std.testing.expect(t.remove(victim));
     try std.testing.expectEqual(@as(usize, bucket_k), t.count());
     try std.testing.expectEqual(@as(usize, 0), t.countReplacements());
     try std.testing.expect(t.buckets[5].find(extra) != null);
 }
 
-test "appendNodesForLogDistances" {
+test "appendNodesForLogDistances only ping_replied" {
     const local = @as(NodeId, @splat(0));
     var t = RoutingTable.init(local);
     var n5a: NodeId = @splat(0);
@@ -392,7 +456,29 @@ test "appendNodesForLogDistances" {
 
     var out: std.ArrayList(NodeId) = .empty;
     defer out.deinit(std.testing.allocator);
-    const dists = [_]u32{ 5, 999 };
-    try t.appendNodesForLogDistances(&dists, std.testing.allocator, &out);
-    try std.testing.expectEqual(@as(usize, 2), out.items.len);
+    try t.appendNodesForLogDistances(&[_]u32{5}, std.testing.allocator, &out);
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+
+    try std.testing.expect(t.markPingReplied(n5b));
+    out.clearRetainingCapacity();
+    try t.appendNodesForLogDistances(&[_]u32{5}, std.testing.allocator, &out);
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
+    try std.testing.expectEqualSlices(u8, &n5b, &out.items[0]);
+}
+
+test "pickStaleBucketForRefresh" {
+    const local = @as(NodeId, @splat(0));
+    var t = RoutingTable.init(local);
+    var n: NodeId = @splat(0);
+    n[31] = 40;
+    _ = try t.add(n);
+    t.markBucketRefreshed(5, 1000);
+
+    try std.testing.expectEqual(@as(?u8, null), t.pickStaleBucketForRefresh(1500, 600));
+
+    var n2: NodeId = @splat(0);
+    n2[0] = 0x80;
+    _ = try t.add(n2);
+    const stale = t.pickStaleBucketForRefresh(2000, 500).?;
+    try std.testing.expectEqual(@as(u8, 255), stale);
 }
