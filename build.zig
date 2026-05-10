@@ -4,11 +4,17 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const zig_varint_mod = b.dependency("zig_varint", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("zig_varint");
+
     const mod = b.addModule("zig_discv5", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    mod.addImport("zig_varint", zig_varint_mod);
 
     const unit_tests = b.addTest(.{
         .name = "zig-discv5-tests",
