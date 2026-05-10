@@ -39,4 +39,5 @@ test {
     _ = topic;
     _ = node;
     _ = udp_runtime;
+    _ = @import("discv5_wire_test_vectors.zig");
 }
