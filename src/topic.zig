@@ -1,7 +1,8 @@
 //! Topic advertisement data structures per [discv5-theory](https://github.com/ethereum/devp2p/blob/master/discv5/discv5-theory.md)
 //! (topic table, FIFO topic queues, registration throttling).
 //!
-//! Wire messages for topics (REGTOPIC, TICKET, …) are marked non-final in discv5-wire; see `message.zig`.
+//! Wire messages for topics (REGTOPIC, TICKET, …) are non-final; inbound decode is gated by the
+//! `experimental_topic_wire` build option in `message.zig` / `wire.zig`.
 
 const std = @import("std");
 const routing = @import("routing.zig");

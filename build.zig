@@ -4,6 +4,15 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const experimental_topic_wire = b.option(
+        bool,
+        "experimental_topic_wire",
+        "Decode non-final discv5 topic wire (0x07–0x0a). When false, those message types are rejected as unknown.",
+    ) orelse true;
+
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "experimental_topic_wire", experimental_topic_wire);
+
     const zig_varint_mod = b.dependency("zig_varint", .{
         .target = target,
         .optimize = optimize,
@@ -16,6 +25,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     mod.addImport("zig_varint", zig_varint_mod);
+    mod.addImport("build_options", build_options.createModule());
 
     const unit_tests = b.addTest(.{
         .name = "zig-discv5-tests",

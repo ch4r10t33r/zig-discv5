@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag to publish (must match semver, e.g. v0.1.0)"
+        required: true
+        default: v0.1.0
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Verify release matches build.zig.zon
+        run: |
+          set -euo pipefail
+          want="${{ github.event.inputs.tag }}"
+          want="${want#v}"
+          got="$(grep -E '^\s*\.version\s*=' build.zig.zon | head -1 | sed -E 's/.*"(.*)".*/\1/')"
+          if [ "$want" != "$got" ]; then
+            echo "Tag version ($want) must match build.zig.zon version ($got). Bump build.zig.zon or pick another tag."
+            exit 1
+          fi
+
+      - name: Format and tests
+        run: |
+          zig fmt --check .
+          zig build test --summary all
+          zig build test --summary all -Dexperimental_topic_wire=false
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
