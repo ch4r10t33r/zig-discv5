@@ -1,18 +1,22 @@
 # zig-discv5
 
-Pure Zig implementation of the Ethereum [**Node Discovery Protocol v5**](https://github.com/ethereum/devp2p/blob/master/discv5/discv5.md) (discv5). The goal is a small, dependency-free library suitable for embedding in clients and tooling.
+Pure Zig implementation of the Ethereum [**Node Discovery Protocol v5**](https://github.com/ethereum/devp2p/blob/master/discv5/discv5.md) (discv5). The goal is a small library suitable for embedding in clients and tooling, with a single Zig dependency ([**zig-varint**](https://github.com/ch4r10t33r/zig-varint)) for shared varint encoding.
+
+**Latest release:** [v0.1.0](https://github.com/ch4r10t33r/zig-discv5/releases/tag/v0.1.0) — semantic version in `build.zig.zon` must match the git tag (without the `v` prefix).
 
 ## Status
 
-The layout is modular; several areas are still stubs (`NotImplemented`) while primitives land first.
+The codebase is modular and **0.1.0** includes a working **local node** (`node`): inbound `handleReceive`, outbound handshake initiation, session cache, encrypted **PING/PONG**, **FINDNODE/NODES** (cached peer ENRs, chunked replies), and **TALKREQ/TALKRESP** (default echo). Routing follows discv5-theory (e.g. FINDNODE only returns **ping_replied** peers). Optional **ingress** rate limits and **egress** limits in the UDP pump share `ingress_limit`.
+
+**Experimental / incomplete relative to the full spec:** non-final [topic advertisement](https://github.com/ethereum/devp2p/blob/master/discv5/discv5.md) message types (0x07–0x0a) are gated behind `-Dexperimental_topic_wire` (default **on**); turn it **off** for strict “unknown type” rejection. Production hardening, interoperability against every client, and topic-advertisement wire finalization are still evolving.
 
 | Area | Module | Notes |
 |------|--------|--------|
-| Shared errors | `errors` | Common error sets |
+| Shared errors | `errors` | Common error sets (includes `NotImplemented` for unused API placeholders) |
 | Varint | `varint` | Unsigned LEB128 (`u64`), minimal encoding, strict decode |
 | RLP | `rlp` | Strings and lists for devp2p payloads |
-| Wire | `wire` | `MessageKind`, `varint`, `packet`, `message`, `message_crypto` |
-| Message | `message` | Ordinary message RLP encode/decode; REGTOPIC/TICKET/REGCONFIRMATION/TOPICQUERY (0x07–0x0a) decode only when `-Dexperimental_topic_wire=true` (default). Encode helpers always exist for tooling. |
+| Wire | `wire` | `MessageKind` + re-exports of `varint`, `packet`, `message`, `message_crypto`, etc. |
+| Message | `message` | Ordinary message RLP encode/decode; REGTOPIC/TICKET/REGCONFIRMATION/TOPICQUERY (0x07–0x0a) decode only when `-Dexperimental_topic_wire=true` (default). Encode helpers exist for tooling. |
 | Message crypto | `message_crypto` | AES-128-GCM for ordinary message ciphertext (spec section 2.3) |
 | ENR | `enr` | EIP-778 textual `enr:` decode (base64url + RLP layout checks) |
 | Handshake | `handshake` (alias `crypto`) | HKDF session keys, identity-proof SHA-256 |
@@ -21,7 +25,9 @@ The layout is modular; several areas are still stubs (`NotImplemented`) while pr
 | Routing | `routing` | Kademlia table: 256 buckets (k=16), per-bucket replacement cache, LRU/MRU, closest + FINDNODE export |
 | Session | `session` | LRU session table (node id + UDP endpoint), cached keys, GCM nonce helper |
 | Topic | `topic` | Topic table per discv5-theory: FIFO queues, per-topic and global caps, `target_ad_lifetime` purge, registration wait hints |
-| Node | `node` | Local node runtime (stub) |
+| Ingress limits | `ingress_limit` | Sliding-window datagram limits (per-peer and global); used by `Node` and `udp_runtime` egress |
+| Node | `node` | Discovery node state machine: sessions, challenges, encrypted messages, routing integration, configurable TTLs and caps |
+| UDP runtime | `udp_runtime` | libc IPv4 UDP socket helpers and receive/emit loop into `Node.handleReceive` (`link_libc` required on the module) |
 
 ## Requirements
 
