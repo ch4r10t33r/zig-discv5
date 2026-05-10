@@ -1,5 +1,8 @@
 //! Discovery v5 node: inbound `handleReceive`, outbound handshake opening, session cache, and encrypted
 //! PING/PONG, FINDNODE/NODES (cached peer ENRs, chunked replies), and TALKREQ/TALKRESP (default echo).
+//!
+//! Pass a shared **`now_ms`** clock into **handleReceive** so optional session TTL, pending WHOAREYOU TTL,
+//! and decrypt-fail recovery (drop session → WHOAREYOU) behave deterministically.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -23,6 +26,12 @@ pub const Config = struct {
     secret_key: [32]u8,
     enr_seq: u64 = 0,
     session_table_cap: usize = 256,
+    /// Drop cached sessions when `now_ms - last_seen_ms` exceeds this. Null disables time-based expiry.
+    session_ttl_ms: ?u64 = null,
+    /// Remove WHOAREYOU challenge state older than this. Null disables.
+    pending_challenge_ttl_ms: ?u64 = null,
+    /// Upper bound on pending WHOAREYOU entries; oldest is evicted when full.
+    pending_challenge_cap: usize = 256,
 };
 
 /// Max number of logarithmic distances in one FINDNODE (discv5 clients typically use small lists).
@@ -39,6 +48,7 @@ pub const Node = struct {
     const PendingChallenge = struct {
         peer_id: NodeId,
         challenge_data: []u8,
+        created_ms: u64,
     };
 
     const OutboundHandshake = struct {
@@ -52,6 +62,8 @@ pub const Node = struct {
     secret_key: [32]u8,
     node_id: NodeId,
     enr_seq: u64,
+    pending_challenge_ttl_ms: ?u64,
+    pending_challenge_cap: usize,
     sessions: session.SessionTable,
     routing: routing.RoutingTable,
     /// Raw ENR RLP bytes keyed by node id (e.g. from verified inbound handshakes). Used for NODES replies.
@@ -63,13 +75,15 @@ pub const Node = struct {
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) InitError!Node {
         const nid = try identity_v4.nodeIdV4FromSecretKey(cfg.secret_key);
-        var sessions = try session.SessionTable.init(allocator, cfg.session_table_cap);
+        var sessions = try session.SessionTable.init(allocator, cfg.session_table_cap, cfg.session_ttl_ms);
         errdefer sessions.deinit();
         return .{
             .allocator = allocator,
             .secret_key = cfg.secret_key,
             .node_id = nid,
             .enr_seq = cfg.enr_seq,
+            .pending_challenge_ttl_ms = cfg.pending_challenge_ttl_ms,
+            .pending_challenge_cap = @max(1, cfg.pending_challenge_cap),
             .sessions = sessions,
             .routing = routing.RoutingTable.init(nid),
             .peer_enrs = .empty,
@@ -111,6 +125,31 @@ pub const Node = struct {
 
     pub fn makeEndpoint(_: *const Node, peer_id: NodeId, ip: session.IpAddr, port: u16) session.UdpEndpoint {
         return .{ .node_id = peer_id, .ip = ip, .port = port };
+    }
+
+    fn pruneExpiredPending(self: *Node, now_ms: u64) void {
+        const ttl = self.pending_challenge_ttl_ms orelse return;
+        var i: usize = 0;
+        while (i < self.pending.items.len) {
+            if (now_ms -| self.pending.items[i].created_ms > ttl) {
+                self.allocator.free(self.pending.items[i].challenge_data);
+                _ = self.pending.swapRemove(i);
+            } else i += 1;
+        }
+    }
+
+    fn evictOldestPending(self: *Node) void {
+        if (self.pending.items.len == 0) return;
+        var min_i: usize = 0;
+        var min_t = self.pending.items[0].created_ms;
+        for (self.pending.items[1..], 1..) |p, j| {
+            if (p.created_ms < min_t) {
+                min_t = p.created_ms;
+                min_i = j;
+            }
+        }
+        self.allocator.free(self.pending.items[min_i].challenge_data);
+        _ = self.pending.swapRemove(min_i);
     }
 
     fn clearPendingForPeer(self: *Node, peer_id: NodeId) void {
@@ -225,22 +264,26 @@ pub const Node = struct {
     }
 
     /// On success, each element of `responses_out` is an allocated reply packet; caller must free them.
+    /// `now_ms` is application monotonic or wall time in milliseconds; used for session and pending-challenge TTL.
     pub fn handleReceive(
         self: *Node,
         remote: RemoteUdp,
         datagram: []const u8,
         responses_out: *std.ArrayList([]u8),
+        now_ms: u64,
     ) ReceiveError!void {
         const alloc = self.allocator;
+
+        self.pruneExpiredPending(now_ms);
 
         const copy = try alloc.dupe(u8, datagram);
         defer alloc.free(copy);
 
         const parsed = try packet.decodeInPlace(&self.node_id, copy);
         switch (parsed.header.flag) {
-            .whoareyou => try self.handleWhoareyouAsInitiator(remote, copy, parsed, responses_out),
-            .message => try self.handleOrdinary(remote, copy, parsed, responses_out),
-            .handshake => try self.handleHandshake(remote, copy, parsed, responses_out),
+            .whoareyou => try self.handleWhoareyouAsInitiator(remote, copy, parsed, responses_out, now_ms),
+            .message => try self.handleOrdinary(remote, copy, parsed, responses_out, now_ms),
+            .handshake => try self.handleHandshake(remote, copy, parsed, responses_out, now_ms),
         }
     }
 
@@ -250,6 +293,7 @@ pub const Node = struct {
         _: []u8,
         parsed: packet.ParsedPacket,
         responses_out: *std.ArrayList([]u8),
+        now_ms: u64,
     ) ReceiveError!void {
         const alloc = self.allocator;
         const o = self.takeOutboundByMessageNonce(parsed.header.nonce) orelse return;
@@ -294,12 +338,47 @@ pub const Node = struct {
         errdefer alloc.free(hs_pkt);
 
         const ep = self.makeEndpoint(o.peer_id, remote.ip, remote.port);
-        try self.sessions.put(ep, session.CachedSession.fromDerived(keys), false);
+        try self.sessions.put(ep, session.CachedSession.fromDerived(keys), false, now_ms);
         errdefer _ = self.sessions.remove(ep);
 
         _ = try self.routing.add(o.peer_id);
 
         try responses_out.append(alloc, hs_pkt);
+    }
+
+    fn sendWhoareyouForUnknownOrdinary(
+        self: *Node,
+        src_id: NodeId,
+        parsed: packet.ParsedPacket,
+        responses_out: *std.ArrayList([]u8),
+        now_ms: u64,
+    ) ReceiveError!void {
+        const alloc = self.allocator;
+
+        self.clearPendingForPeer(src_id);
+
+        while (self.pending.items.len >= self.pending_challenge_cap) {
+            self.evictOldestPending();
+        }
+
+        var iv: [16]u8 = undefined;
+        fillRandomBytes(&iv);
+        var id_nonce: [16]u8 = undefined;
+        fillRandomBytes(&id_nonce);
+
+        const challenge = try packet.allocWhoareyouChallengeData(alloc, iv, parsed.header.nonce, id_nonce, self.enr_seq);
+        errdefer alloc.free(challenge);
+
+        try self.pending.append(alloc, .{ .peer_id = src_id, .challenge_data = challenge, .created_ms = now_ms });
+        errdefer {
+            const last = self.pending.pop() orelse unreachable;
+            alloc.free(last.challenge_data);
+        }
+
+        const way = try packet.encodeWhoareyouPacket(alloc, src_id, iv, parsed.header.nonce, id_nonce, self.enr_seq);
+        errdefer alloc.free(way);
+
+        try responses_out.append(alloc, way);
     }
 
     fn handleOrdinary(
@@ -308,6 +387,7 @@ pub const Node = struct {
         copy: []u8,
         parsed: packet.ParsedPacket,
         responses_out: *std.ArrayList([]u8),
+        now_ms: u64,
     ) ReceiveError!void {
         const alloc = self.allocator;
         const auth = try parsed.decodeAuth();
@@ -317,13 +397,22 @@ pub const Node = struct {
         };
         const ep = self.makeEndpoint(src_id, remote.ip, remote.port);
 
-        if (self.sessions.get(ep)) |lu| {
+        if (self.sessions.get(ep, now_ms)) |lu| {
             const read_key = if (lu.peer_handshake_initiator)
                 lu.session.readKeyPeerWasInitiator()
             else
                 lu.session.readKeyWeWereInitiator();
 
-            const plain = try message_crypto.decryptOrdinaryMessage(alloc, copy, &parsed, read_key);
+            const plain = message_crypto.decryptOrdinaryMessage(alloc, copy, &parsed, read_key) catch |err| {
+                switch (err) {
+                    error.DecryptFailed, error.CiphertextTooShort => {
+                        _ = self.sessions.remove(ep);
+                        try self.sendWhoareyouForUnknownOrdinary(src_id, parsed, responses_out, now_ms);
+                        return;
+                    },
+                    else => return err,
+                }
+            };
             defer alloc.free(plain);
 
             var decoded = try message.decodePlaintext(plain, alloc);
@@ -351,26 +440,7 @@ pub const Node = struct {
             return;
         }
 
-        self.clearPendingForPeer(src_id);
-
-        var iv: [16]u8 = undefined;
-        fillRandomBytes(&iv);
-        var id_nonce: [16]u8 = undefined;
-        fillRandomBytes(&id_nonce);
-
-        const challenge = try packet.allocWhoareyouChallengeData(alloc, iv, parsed.header.nonce, id_nonce, self.enr_seq);
-        errdefer alloc.free(challenge);
-
-        try self.pending.append(alloc, .{ .peer_id = src_id, .challenge_data = challenge });
-        errdefer {
-            const last = self.pending.pop() orelse unreachable;
-            alloc.free(last.challenge_data);
-        }
-
-        const way = try packet.encodeWhoareyouPacket(alloc, src_id, iv, parsed.header.nonce, id_nonce, self.enr_seq);
-        errdefer alloc.free(way);
-
-        try responses_out.append(alloc, way);
+        try self.sendWhoareyouForUnknownOrdinary(src_id, parsed, responses_out, now_ms);
     }
 
     fn buildEncryptedOrdinaryReply(
@@ -486,6 +556,7 @@ pub const Node = struct {
         copy: []u8,
         parsed: packet.ParsedPacket,
         responses_out: *std.ArrayList([]u8),
+        now_ms: u64,
     ) ReceiveError!void {
         const alloc = self.allocator;
         const auth = try parsed.decodeAuth();
@@ -518,7 +589,7 @@ pub const Node = struct {
         try self.rememberPeerRecord(initiator_id, hs.record);
 
         const ep = self.makeEndpoint(initiator_id, remote.ip, remote.port);
-        try self.sessions.put(ep, session.CachedSession.fromDerived(keys), true);
+        try self.sessions.put(ep, session.CachedSession.fromDerived(keys), true, now_ms);
         _ = try self.routing.add(initiator_id);
 
         if (parsed.message_cipher.len == 0) return;
@@ -531,7 +602,7 @@ pub const Node = struct {
         defer decoded.deinit(alloc);
         switch (decoded) {
             .ping => |p| {
-                const lu = self.sessions.get(ep) orelse unreachable;
+                const lu = self.sessions.get(ep, now_ms) orelse unreachable;
                 const reply = try self.buildEncryptedPong(remote, ep, lu, p);
                 errdefer alloc.free(reply);
                 try responses_out.append(alloc, reply);
@@ -650,7 +721,7 @@ test "unknown session ordinary yields WHOAREYOU with echoed nonce" {
     }
 
     const remote: RemoteUdp = .{ .ip = .{ .v4 = .{ 10, 0, 0, 1 } }, .port = 30303 };
-    try node_b.handleReceive(remote, ordinary, &responses);
+    try node_b.handleReceive(remote, ordinary, &responses, 0);
 
     try std.testing.expectEqual(@as(usize, 1), responses.items.len);
     const dec_copy = try alloc.dupe(u8, responses.items[0]);
@@ -677,7 +748,7 @@ test "session present ping yields encrypted pong" {
     const keys = handshake.deriveSessionKeys(&ikm, &challenge, id_a, node_b.node_id);
 
     const ep = node_b.makeEndpoint(id_a, .{ .v4 = .{ 192, 168, 1, 20 } }, 9000);
-    try node_b.sessions.put(ep, session.CachedSession.fromDerived(keys), true);
+    try node_b.sessions.put(ep, session.CachedSession.fromDerived(keys), true, 0);
 
     var iv: [16]u8 = undefined;
     @memset(&iv, 0x3c);
@@ -707,7 +778,7 @@ test "session present ping yields encrypted pong" {
     }
 
     const remote: RemoteUdp = .{ .ip = ep.ip, .port = ep.port };
-    try node_b.handleReceive(remote, ordinary, &responses);
+    try node_b.handleReceive(remote, ordinary, &responses, 0);
 
     try std.testing.expectEqual(@as(usize, 1), responses.items.len);
     const pong_copy = try alloc.dupe(u8, responses.items[0]);
@@ -760,7 +831,7 @@ test "responder completes handshake and answers ping inside handshake" {
         responses.deinit(alloc);
     }
     const remote: RemoteUdp = .{ .ip = .{ .v4 = .{ 10, 9, 8, 7 } }, .port = 40404 };
-    try node_b.handleReceive(remote, ordinary, &responses);
+    try node_b.handleReceive(remote, ordinary, &responses, 0);
     try std.testing.expectEqual(@as(usize, 1), responses.items.len);
     const way = responses.items[0];
 
@@ -833,7 +904,7 @@ test "responder completes handshake and answers ping inside handshake" {
     for (responses.items) |s| alloc.free(s);
     responses.clearRetainingCapacity();
 
-    try node_b.handleReceive(remote, hs_pkt, &responses);
+    try node_b.handleReceive(remote, hs_pkt, &responses, 0);
     try std.testing.expectEqual(@as(usize, 1), responses.items.len);
 
     const pong_wire = responses.items[0];
@@ -875,7 +946,7 @@ test "initiator opening ping completes handshake after WHOAREYOU" {
         for (from_b.items) |s| alloc.free(s);
         from_b.deinit(alloc);
     }
-    try node_b.handleReceive(remote_a, ordinary, &from_b);
+    try node_b.handleReceive(remote_a, ordinary, &from_b, 0);
     try std.testing.expectEqual(@as(usize, 1), from_b.items.len);
     const way = from_b.items[0];
 
@@ -884,20 +955,20 @@ test "initiator opening ping completes handshake after WHOAREYOU" {
         for (from_a.items) |s| alloc.free(s);
         from_a.deinit(alloc);
     }
-    try node_a.handleReceive(remote_b, way, &from_a);
+    try node_a.handleReceive(remote_b, way, &from_a, 0);
     try std.testing.expectEqual(@as(usize, 1), from_a.items.len);
     const hs = from_a.items[0];
 
     for (from_b.items) |s| alloc.free(s);
     from_b.clearRetainingCapacity();
 
-    try node_b.handleReceive(remote_a, hs, &from_b);
+    try node_b.handleReceive(remote_a, hs, &from_b, 0);
     try std.testing.expectEqual(@as(usize, 0), from_b.items.len);
 
     const ep_on_a = node_a.makeEndpoint(id_b, remote_b.ip, remote_b.port);
     const ep_on_b = node_b.makeEndpoint(id_a, remote_a.ip, remote_a.port);
-    const lu_a = node_a.sessions.get(ep_on_a) orelse unreachable;
-    const lu_b = node_b.sessions.get(ep_on_b) orelse unreachable;
+    const lu_a = node_a.sessions.get(ep_on_a, 0) orelse unreachable;
+    const lu_b = node_b.sessions.get(ep_on_b, 0) orelse unreachable;
     try std.testing.expect(!lu_a.peer_handshake_initiator);
     try std.testing.expect(lu_b.peer_handshake_initiator);
 
@@ -928,7 +999,7 @@ test "initiator opening ping completes handshake after WHOAREYOU" {
         for (from_b2.items) |s| alloc.free(s);
         from_b2.deinit(alloc);
     }
-    try node_b.handleReceive(remote_a, ordinary2, &from_b2);
+    try node_b.handleReceive(remote_a, ordinary2, &from_b2, 0);
     try std.testing.expectEqual(@as(usize, 1), from_b2.items.len);
 
     const pong_copy = try alloc.dupe(u8, from_b2.items[0]);
@@ -966,7 +1037,7 @@ test "session findnode returns encrypted nodes for cached peer enrs" {
     const keys = handshake.deriveSessionKeys(&ikm, &challenge, id_a, node_b.node_id);
 
     const ep = node_b.makeEndpoint(id_a, .{ .v4 = .{ 172, 16, 0, 5 } }, 30305);
-    try node_b.sessions.put(ep, session.CachedSession.fromDerived(keys), true);
+    try node_b.sessions.put(ep, session.CachedSession.fromDerived(keys), true, 0);
 
     var iv: [16]u8 = undefined;
     @memset(&iv, 0x4d);
@@ -996,7 +1067,7 @@ test "session findnode returns encrypted nodes for cached peer enrs" {
     }
 
     const remote: RemoteUdp = .{ .ip = ep.ip, .port = ep.port };
-    try node_b.handleReceive(remote, ordinary, &responses);
+    try node_b.handleReceive(remote, ordinary, &responses, 0);
 
     try std.testing.expectEqual(@as(usize, 1), responses.items.len);
 
@@ -1030,7 +1101,7 @@ test "session talkreq yields talkresp echoing message payload" {
     const keys = handshake.deriveSessionKeys(&ikm, &challenge, id_a, node_b.node_id);
 
     const ep = node_b.makeEndpoint(id_a, .{ .v4 = .{ 192, 0, 2, 3 } }, 40443);
-    try node_b.sessions.put(ep, session.CachedSession.fromDerived(keys), true);
+    try node_b.sessions.put(ep, session.CachedSession.fromDerived(keys), true, 0);
 
     var iv: [16]u8 = undefined;
     @memset(&iv, 0x71);
@@ -1060,7 +1131,7 @@ test "session talkreq yields talkresp echoing message payload" {
     }
 
     const remote: RemoteUdp = .{ .ip = ep.ip, .port = ep.port };
-    try node_b.handleReceive(remote, ordinary, &responses);
+    try node_b.handleReceive(remote, ordinary, &responses, 0);
 
     try std.testing.expectEqual(@as(usize, 1), responses.items.len);
 
@@ -1074,4 +1145,119 @@ test "session talkreq yields talkresp echoing message payload" {
     try std.testing.expect(dec == .talkresp);
     try std.testing.expectEqualSlices(u8, &.{ 0x01, 0x02 }, dec.talkresp.req_id);
     try std.testing.expectEqualSlices(u8, "hello", dec.talkresp.response);
+}
+
+test "decrypt failure with cached session drops session and sends WHOAREYOU" {
+    const alloc = std.testing.allocator;
+
+    var sk_b: [32]u8 = @splat(0);
+    sk_b[31] = 41;
+    var node_b = try Node.init(alloc, .{ .secret_key = sk_b });
+    defer node_b.deinit();
+
+    var sk_a: [32]u8 = @splat(0);
+    sk_a[31] = 43;
+    const id_a = try identity_v4.nodeIdV4FromSecretKey(sk_a);
+
+    const ikm = [_]u8{0x0e} ++ [_]u8{0x66} ** 32;
+    const challenge = [_]u8{0xaa} ** (packet.static_prefix_size + packet.whoareyou_auth_size);
+    const keys = handshake.deriveSessionKeys(&ikm, &challenge, id_a, node_b.node_id);
+
+    const ep = node_b.makeEndpoint(id_a, .{ .v4 = .{ 10, 1, 2, 3 } }, 9001);
+    try node_b.sessions.put(ep, session.CachedSession.fromDerived(keys), true, 0);
+
+    var iv: [16]u8 = undefined;
+    @memset(&iv, 0x81);
+    var nonce: [12]u8 = undefined;
+    @memset(&nonce, 0x92);
+
+    const ping_pt = try message.encodePingPlaintext(alloc, &.{0xef}, 1);
+    defer alloc.free(ping_pt);
+
+    var prefix: [packet.static_prefix_size + packet.message_auth_size]u8 = undefined;
+    @memcpy(prefix[0..16], &iv);
+    var static_plain: [packet.static_header_size]u8 = undefined;
+    packet.writePlaintextStaticHeader(&static_plain, .message, nonce, packet.message_auth_size);
+    @memcpy(prefix[16..][0..packet.static_header_size], &static_plain);
+    @memcpy(prefix[packet.static_prefix_size..][0..packet.message_auth_size], &id_a);
+
+    const ct = try message_crypto.encryptMessage(alloc, keys.recipient_key, nonce, ping_pt, &prefix);
+    defer alloc.free(ct);
+
+    const ordinary = try packet.encodeOrdinaryMessagePacket(alloc, node_b.node_id, iv, nonce, id_a, ct);
+    defer alloc.free(ordinary);
+
+    var responses: std.ArrayList([]u8) = .empty;
+    defer {
+        for (responses.items) |s| alloc.free(s);
+        responses.deinit(alloc);
+    }
+
+    const remote: RemoteUdp = .{ .ip = ep.ip, .port = ep.port };
+    try node_b.handleReceive(remote, ordinary, &responses, 0);
+
+    try std.testing.expectEqual(@as(usize, 1), responses.items.len);
+    const way_copy = try alloc.dupe(u8, responses.items[0]);
+    defer alloc.free(way_copy);
+    const parsed = try packet.decodeInPlace(&id_a, way_copy);
+    try std.testing.expect(parsed.header.flag == .whoareyou);
+    try std.testing.expect(node_b.sessions.get(ep, 0) == null);
+}
+
+test "session TTL expiry treats next ordinary as unknown session" {
+    const alloc = std.testing.allocator;
+
+    var sk_b: [32]u8 = @splat(0);
+    sk_b[31] = 47;
+    var node_b = try Node.init(alloc, .{ .secret_key = sk_b, .session_ttl_ms = 1000 });
+    defer node_b.deinit();
+
+    var sk_a: [32]u8 = @splat(0);
+    sk_a[31] = 53;
+    const id_a = try identity_v4.nodeIdV4FromSecretKey(sk_a);
+
+    const ikm = [_]u8{0x0f} ++ [_]u8{0x77} ** 32;
+    const challenge = [_]u8{0xbb} ** (packet.static_prefix_size + packet.whoareyou_auth_size);
+    const keys = handshake.deriveSessionKeys(&ikm, &challenge, id_a, node_b.node_id);
+
+    const ep = node_b.makeEndpoint(id_a, .{ .v4 = .{ 10, 2, 3, 4 } }, 9002);
+    const t_establish: u64 = 1_000_000;
+    try node_b.sessions.put(ep, session.CachedSession.fromDerived(keys), true, t_establish);
+
+    var iv: [16]u8 = undefined;
+    @memset(&iv, 0x93);
+    var nonce: [12]u8 = undefined;
+    @memset(&nonce, 0xa4);
+
+    const ping_pt = try message.encodePingPlaintext(alloc, &.{0xfe}, 2);
+    defer alloc.free(ping_pt);
+
+    var prefix: [packet.static_prefix_size + packet.message_auth_size]u8 = undefined;
+    @memcpy(prefix[0..16], &iv);
+    var static_plain: [packet.static_header_size]u8 = undefined;
+    packet.writePlaintextStaticHeader(&static_plain, .message, nonce, packet.message_auth_size);
+    @memcpy(prefix[16..][0..packet.static_header_size], &static_plain);
+    @memcpy(prefix[packet.static_prefix_size..][0..packet.message_auth_size], &id_a);
+
+    const ct = try message_crypto.encryptMessage(alloc, keys.initiator_key, nonce, ping_pt, &prefix);
+    defer alloc.free(ct);
+
+    const ordinary = try packet.encodeOrdinaryMessagePacket(alloc, node_b.node_id, iv, nonce, id_a, ct);
+    defer alloc.free(ordinary);
+
+    var responses: std.ArrayList([]u8) = .empty;
+    defer {
+        for (responses.items) |s| alloc.free(s);
+        responses.deinit(alloc);
+    }
+
+    const remote: RemoteUdp = .{ .ip = ep.ip, .port = ep.port };
+    const t_late = t_establish + 1001;
+    try node_b.handleReceive(remote, ordinary, &responses, t_late);
+
+    try std.testing.expectEqual(@as(usize, 1), responses.items.len);
+    const way_copy = try alloc.dupe(u8, responses.items[0]);
+    defer alloc.free(way_copy);
+    const parsed = try packet.decodeInPlace(&id_a, way_copy);
+    try std.testing.expect(parsed.header.flag == .whoareyou);
 }

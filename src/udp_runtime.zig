@@ -122,6 +122,7 @@ pub const PumpError = RecvError || SendError || Node.ReceiveError || std.mem.All
 
 /// Receives at most one datagram, runs `Node.handleReceive`, and sends each reply to the source address.
 /// `responses` must be empty on entry; allocated replies are freed before returning.
+/// `now_ms` is forwarded to the node (session / pending TTL); use the same clock as the rest of your app.
 pub fn pumpOnce(
     allocator: std.mem.Allocator,
     sock: UdpSocket,
@@ -129,13 +130,14 @@ pub fn pumpOnce(
     recv_buf: []u8,
     responses: *std.ArrayList([]u8),
     recv_flags: u32,
+    now_ms: u64,
 ) PumpError!enum { idle, progressed } {
     std.debug.assert(responses.items.len == 0);
 
     const got = try recvDatagram(sock, recv_buf, recv_flags) orelse return .idle;
     std.debug.assert(got.len <= recv_buf.len);
 
-    try node_ptr.handleReceive(got.remote, recv_buf[0..got.len], responses);
+    try node_ptr.handleReceive(got.remote, recv_buf[0..got.len], responses, now_ms);
     defer {
         for (responses.items) |p| allocator.free(p);
         responses.clearRetainingCapacity();
@@ -163,7 +165,7 @@ test "nonblocking pump is idle when no datagram" {
     var responses: std.ArrayList([]u8) = .empty;
     defer responses.deinit(alloc);
 
-    const st = try pumpOnce(alloc, sock, &n, &recv_buf, &responses, recv_flags_nonblocking);
+    const st = try pumpOnce(alloc, sock, &n, &recv_buf, &responses, recv_flags_nonblocking, 0);
     try std.testing.expectEqual(@as(@TypeOf(st), .idle), st);
 }
 
@@ -217,7 +219,7 @@ test "UDP pump sends WHOAREYOU to peer socket" {
     var responses: std.ArrayList([]u8) = .empty;
     defer responses.deinit(alloc);
 
-    const st = try pumpOnce(alloc, server, &node_b, &recv_buf, &responses, 0);
+    const st = try pumpOnce(alloc, server, &node_b, &recv_buf, &responses, 0, 0);
     try std.testing.expectEqual(@as(@TypeOf(st), .progressed), st);
 
     var reply_buf: [packet.max_packet_size]u8 = undefined;

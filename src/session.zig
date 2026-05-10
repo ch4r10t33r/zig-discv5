@@ -85,6 +85,8 @@ const Entry = struct {
     session: CachedSession,
     peer_handshake_initiator: bool,
     last_touch: u64,
+    /// Wall-clock ms from the application; refreshed on **put** and successful **get**.
+    last_seen_ms: u64,
 };
 
 pub const SessionLookup = struct {
@@ -96,14 +98,17 @@ pub const SessionLookup = struct {
 pub const SessionTable = struct {
     allocator: std.mem.Allocator,
     max_entries: usize,
+    /// When non-null, entries older than this many milliseconds (by `last_seen_ms`) are dropped on **get**.
+    session_ttl_ms: ?u64,
     entries: std.ArrayList(Entry),
     clock: u64 = 0,
 
-    pub fn init(allocator: std.mem.Allocator, max_entries: usize) InitError!SessionTable {
+    pub fn init(allocator: std.mem.Allocator, max_entries: usize, session_ttl_ms: ?u64) InitError!SessionTable {
         if (max_entries == 0) return error.ZeroCapacity;
         return .{
             .allocator = allocator,
             .max_entries = max_entries,
+            .session_ttl_ms = session_ttl_ms,
             .entries = .empty,
         };
     }
@@ -123,12 +128,14 @@ pub const SessionTable = struct {
         ep: UdpEndpoint,
         sess: CachedSession,
         peer_handshake_initiator: bool,
+        now_ms: u64,
     ) std.mem.Allocator.Error!void {
         for (self.entries.items) |*e| {
             if (ep.eql(e.ep)) {
                 e.session = sess;
                 e.peer_handshake_initiator = peer_handshake_initiator;
                 e.last_touch = self.bump();
+                e.last_seen_ms = now_ms;
                 return;
             }
         }
@@ -140,6 +147,7 @@ pub const SessionTable = struct {
                 .session = sess,
                 .peer_handshake_initiator = peer_handshake_initiator,
                 .last_touch = touch,
+                .last_seen_ms = now_ms,
             });
             return;
         }
@@ -157,13 +165,22 @@ pub const SessionTable = struct {
             .session = sess,
             .peer_handshake_initiator = peer_handshake_initiator,
             .last_touch = touch,
+            .last_seen_ms = now_ms,
         };
     }
 
     /// Returns the session for `ep` after marking it most-recently used, or `null`.
-    pub fn get(self: *SessionTable, ep: UdpEndpoint) ?SessionLookup {
-        for (self.entries.items) |*e| {
+    /// Drops the entry when **session_ttl_ms** is set and the entry is stale relative to `now_ms`.
+    pub fn get(self: *SessionTable, ep: UdpEndpoint, now_ms: u64) ?SessionLookup {
+        for (self.entries.items, 0..) |*e, i| {
             if (ep.eql(e.ep)) {
+                if (self.session_ttl_ms) |ttl| {
+                    if (now_ms -| e.last_seen_ms > ttl) {
+                        _ = self.entries.swapRemove(i);
+                        return null;
+                    }
+                }
+                e.last_seen_ms = now_ms;
                 e.last_touch = self.bump();
                 return .{
                     .session = &e.session,
@@ -214,7 +231,7 @@ test "CachedSession nonce sequence" {
 
 test "SessionTable LRU eviction" {
     const alloc = std.testing.allocator;
-    var t = try SessionTable.init(alloc, 2);
+    var t = try SessionTable.init(alloc, 2, null);
     defer t.deinit();
 
     const ep_a: UdpEndpoint = .{
@@ -237,19 +254,38 @@ test "SessionTable LRU eviction" {
     const sb = CachedSession{ .initiator_key = @splat(0xbb), .recipient_key = @splat(0), .outbound_nonce_counter = 0 };
     const sc = CachedSession{ .initiator_key = @splat(0xcc), .recipient_key = @splat(0), .outbound_nonce_counter = 0 };
 
-    try t.put(ep_a, sa, false);
-    try t.put(ep_b, sb, false);
+    try t.put(ep_a, sa, false, 0);
+    try t.put(ep_b, sb, false, 0);
     try std.testing.expectEqual(@as(usize, 2), t.count());
 
-    _ = t.get(ep_a);
-    try t.put(ep_c, sc, false);
+    _ = t.get(ep_a, 0);
+    try t.put(ep_c, sc, false, 0);
 
-    try std.testing.expect(t.get(ep_a) != null);
-    try std.testing.expect(t.get(ep_c) != null);
-    try std.testing.expect(t.get(ep_b) == null);
+    try std.testing.expect(t.get(ep_a, 0) != null);
+    try std.testing.expect(t.get(ep_c, 0) != null);
+    try std.testing.expect(t.get(ep_b, 0) == null);
 
     try std.testing.expect(t.remove(ep_a));
     try std.testing.expectEqual(@as(usize, 1), t.count());
+}
+
+test "SessionTable TTL drops stale entry on get" {
+    const alloc = std.testing.allocator;
+    var t = try SessionTable.init(alloc, 4, 1000);
+    defer t.deinit();
+
+    const ep: UdpEndpoint = .{
+        .node_id = @splat(9),
+        .ip = .{ .v4 = .{ 127, 0, 0, 1 } },
+        .port = 9000,
+    };
+    const s = CachedSession{ .initiator_key = @splat(1), .recipient_key = @splat(2), .outbound_nonce_counter = 0 };
+
+    try t.put(ep, s, false, 10_000);
+    try std.testing.expect(t.get(ep, 10_999) != null);
+    // A successful **get** refreshes `last_seen_ms`, so advance time by more than TTL since that touch.
+    try std.testing.expect(t.get(ep, 12_000) == null);
+    try std.testing.expectEqual(@as(usize, 0), t.count());
 }
 
 test "fromDerived" {
